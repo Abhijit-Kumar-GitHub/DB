@@ -1,4 +1,18 @@
 // main.cpp - Enhanced Version with Persistence Fix
+
+/*
+ * TABLE OF CONTENTS:
+ * 1. InputBuffer Functions (line 19)
+ * 2. Pager Functions (line 36)
+ * 3. Table Functions (line 169)
+ * 4. Meta-Command Function (line 245)
+ * 4. B-Tree Node Accessors (line )
+ * 5. B-Tree Operations (line )
+ * 6. Executor Functions (line )
+ * 7. Visualization (line )
+ * 8. Main REPL (line )
+ */
+
 #include "db.hpp"
 
 using namespace std;
