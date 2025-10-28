@@ -49,7 +49,7 @@ typedef struct {
 
 // Table Structure constants
 #define PAGE_SIZE 4096
-#define TABLE_MAX_PAGES 100
+#define TABLE_MAX_PAGES 100000 // Increased to support very large databases
 #define ID_SIZE sizeof(uint32_t)
 #define USERNAME_SIZE COLUMN_USERNAME_SIZE
 #define EMAIL_SIZE COLUMN_EMAIL_SIZE

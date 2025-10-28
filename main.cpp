@@ -628,6 +628,8 @@ void create_new_root(Table* table, uint32_t right_child_page_num) {
     set_node_root(right_child, false);
 }
 
+void internal_node_split_and_insert(Table* table, uint32_t parent_page_num, uint32_t child_page_num);
+
 void internal_node_insert(Table* table, uint32_t parent_page_num, uint32_t child_page_num) {
     // Add a new child/key pair to parent that corresponds to child
     void* parent = pager_get_page(table->pager, parent_page_num);
@@ -645,10 +647,10 @@ void internal_node_insert(Table* table, uint32_t parent_page_num, uint32_t child
 
     uint32_t original_num_keys = *get_internal_node_num_keys(parent);
     
-    // For now, assume internal node has space (we'll handle splitting later if needed)
+    // Check if the node needs to be split
     if (original_num_keys >= INTERNAL_NODE_MAX_KEYS) {
-        cout << "Error: Need to implement splitting internal node" << endl;
-        exit(EXIT_FAILURE);
+        internal_node_split_and_insert(table, parent_page_num, child_page_num);
+        return;
     }
 
     uint32_t right_child_page_num = *get_internal_node_right_child(parent);
@@ -670,6 +672,110 @@ void internal_node_insert(Table* table, uint32_t parent_page_num, uint32_t child
         *get_internal_node_key(parent, index) = child_max_key;
     }
     *get_internal_node_num_keys(parent) += 1;
+}
+
+void internal_node_split_and_insert(Table* table, uint32_t parent_page_num, uint32_t child_page_num) {
+    void* old_node = pager_get_page(table->pager, parent_page_num);
+    uint32_t old_num_keys = *get_internal_node_num_keys(old_node);
+    
+    // Create a new internal node
+    uint32_t new_page_num = get_unused_page_num(table->pager);
+    void* new_node = pager_get_page(table->pager, new_page_num);
+    initialize_internal_node(new_node);
+    
+    // Allocate a temporary buffer to hold all keys and children including the new one
+    uint32_t* temp_keys = new uint32_t[INTERNAL_NODE_MAX_KEYS + 1];
+    uint32_t* temp_children = new uint32_t[INTERNAL_NODE_MAX_KEYS + 2];
+    
+    // Copy existing keys and children to temp arrays
+    for (uint32_t i = 0; i < old_num_keys; i++) {
+        temp_children[i] = *get_internal_node_child(old_node, i);
+        temp_keys[i] = *get_internal_node_key(old_node, i);
+    }
+    temp_children[old_num_keys] = *get_internal_node_right_child(old_node);
+    
+    // Find where to insert the new child
+    void* child = pager_get_page(table->pager, child_page_num);
+    uint32_t child_max_key = get_node_max_key(table->pager, child);
+    uint32_t insert_index = old_num_keys;
+    
+    for (uint32_t i = 0; i < old_num_keys; i++) {
+        if (child_max_key < temp_keys[i]) {
+            insert_index = i;
+            break;
+        }
+    }
+    
+    // Insert the new key and child into the temp arrays
+    for (uint32_t i = old_num_keys; i > insert_index; i--) {
+        temp_keys[i] = temp_keys[i - 1];
+        temp_children[i + 1] = temp_children[i];
+    }
+    temp_keys[insert_index] = child_max_key;
+    temp_children[insert_index + 1] = child_page_num;
+    
+    // Split point: distribute keys evenly
+    uint32_t split_at = (old_num_keys + 1) / 2;
+    
+    // Update old node with left half
+    *get_internal_node_num_keys(old_node) = split_at;
+    for (uint32_t i = 0; i < split_at; i++) {
+        *get_internal_node_child(old_node, i) = temp_children[i];
+        *get_internal_node_key(old_node, i) = temp_keys[i];
+    }
+    *get_internal_node_right_child(old_node) = temp_children[split_at];
+    
+    // Populate new node with right half
+    uint32_t new_num_keys = old_num_keys - split_at;
+    *get_internal_node_num_keys(new_node) = new_num_keys;
+    for (uint32_t i = 0; i < new_num_keys; i++) {
+        *get_internal_node_child(new_node, i) = temp_children[split_at + 1 + i];
+        *get_internal_node_key(new_node, i) = temp_keys[split_at + 1 + i];
+    }
+    *get_internal_node_right_child(new_node) = temp_children[old_num_keys + 1];
+    
+    // Update parent pointers for all children of both nodes
+    for (uint32_t i = 0; i <= split_at; i++) {
+        void* child_node = pager_get_page(table->pager, *get_internal_node_child(old_node, i <= split_at - 1 ? i : split_at));
+        if (i == split_at) {
+            child_node = pager_get_page(table->pager, *get_internal_node_right_child(old_node));
+        }
+        *get_node_parent(child_node) = parent_page_num;
+    }
+    
+    for (uint32_t i = 0; i <= new_num_keys; i++) {
+        void* child_node = pager_get_page(table->pager, i < new_num_keys ? *get_internal_node_child(new_node, i) : *get_internal_node_right_child(new_node));
+        *get_node_parent(child_node) = new_page_num;
+    }
+    
+    // Update parent node
+    *get_node_parent(new_node) = *get_node_parent(old_node);
+    
+    // Free temporary arrays
+    delete[] temp_keys;
+    delete[] temp_children;
+    
+    // If the old node is root, create a new root
+    if (is_node_root(old_node)) {
+        create_new_root(table, new_page_num);
+    } else {
+        // Insert the new node into its parent
+        uint32_t parent_page_num_for_insert = *get_node_parent(old_node);
+        uint32_t new_max = get_node_max_key(table->pager, old_node);
+        void* parent = pager_get_page(table->pager, parent_page_num_for_insert);
+        
+        // Update the old max key in the parent
+        uint32_t num_keys = *get_internal_node_num_keys(parent);
+        for (uint32_t i = 0; i < num_keys; i++) {
+            if (*get_internal_node_child(parent, i) == parent_page_num) {
+                *get_internal_node_key(parent, i) = new_max;
+                break;
+            }
+        }
+        
+        // Insert the new child into the parent (this may recursively split)
+        internal_node_insert(table, parent_page_num_for_insert, new_page_num);
+    }
 }
 
 void leaf_node_split_and_insert(Cursor* cursor, uint32_t key, Row* value) {
