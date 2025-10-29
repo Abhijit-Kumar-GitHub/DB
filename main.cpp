@@ -49,12 +49,14 @@ Pager* pager_open(const string& filename) {
         }
         // Initialize header for new file
         pager->root_page_num = 0; // Root starts at page 0
+        pager->free_head = 0;     // No free pages initially
         pager->num_pages = 1;     // Start with one page (the root)
         pager->file_length = PAGE_SIZE + DB_FILE_HEADER_SIZE; // Header + 1 page
 
-        // Write the initial header
+        // Write the initial header (root_page_num + free_head)
         pager->file_stream.seekp(0);
         pager->file_stream.write(reinterpret_cast<char*>(&pager->root_page_num), sizeof(pager->root_page_num));
+        pager->file_stream.write(reinterpret_cast<char*>(&pager->free_head), sizeof(pager->free_head));
         // Ensure file is large enough for header + initial page
         char zero_page[PAGE_SIZE] = {0};
         pager->file_stream.seekp(DB_FILE_HEADER_SIZE);
@@ -64,9 +66,10 @@ Pager* pager_open(const string& filename) {
         // Note: The root page will be properly initialized in new_table()
 
     } else {
-        // File exists, read header
+        // File exists, read header (root_page_num + free_head)
         pager->file_stream.seekg(0);
         pager->file_stream.read(reinterpret_cast<char*>(&pager->root_page_num), sizeof(pager->root_page_num));
+        pager->file_stream.read(reinterpret_cast<char*>(&pager->free_head), sizeof(pager->free_head));
         if (pager->file_stream.fail()) {
             cout << "Error reading database file header: " << filename << endl;
             exit(EXIT_FAILURE);
@@ -100,7 +103,7 @@ uint64_t get_page_file_offset(uint32_t page_num) {
 void* pager_get_page(Pager* pager, uint32_t page_num) {
     if (page_num >= TABLE_MAX_PAGES) {
         cout << "Error: Tried to access page number out of bounds: " << page_num << endl;
-        exit(EXIT_FAILURE);
+        return nullptr; // Return nullptr instead of exit
     }
 
     if (pager->pages[page_num] != nullptr) {
@@ -122,8 +125,9 @@ void* pager_get_page(Pager* pager, uint32_t page_num) {
         pager->file_stream.read(static_cast<char*>(page), PAGE_SIZE);
 
         if (pager->file_stream.fail() && !pager->file_stream.eof()) {
-            cout << "Error reading page " << page_num << " from file." << endl;
-            exit(EXIT_FAILURE);
+            cout << "Error: Failed to read page " << page_num << " from file." << endl;
+            delete[] static_cast<char*>(page);
+            return nullptr; // Return nullptr instead of exit
         }
         // Clear fail bits if we only hit EOF (reading partial last page is ok conceptually, though our format assumes full pages)
         if (pager->file_stream.eof()) {
@@ -140,18 +144,16 @@ void* pager_get_page(Pager* pager, uint32_t page_num) {
     return page;
 }
 
-void pager_flush(Pager* pager, uint32_t page_num) {
+PagerResult pager_flush(Pager* pager, uint32_t page_num) {
     if (pager->pages[page_num] == nullptr) {
-        cout << "Error: Tried to flush a null page." << endl;
-        exit(EXIT_FAILURE);
+        return PAGER_NULL_PAGE;
     }
 
     pager->file_stream.seekp(get_page_file_offset(page_num));
     pager->file_stream.write(static_cast<char*>(pager->pages[page_num]), PAGE_SIZE);
 
     if (pager->file_stream.fail()) {
-        cout << "Error writing page " << page_num << " to file." << endl;
-        exit(EXIT_FAILURE);
+        return PAGER_DISK_ERROR;
     }
 
     // Ensure file_length is updated if we wrote a new page
@@ -160,11 +162,55 @@ void pager_flush(Pager* pager, uint32_t page_num) {
         pager->file_length = expected_length;
         // Implicitly, pager->num_pages should reflect this, ensured by pager_get_page
     }
+    
+    return PAGER_SUCCESS;
 }
 
 uint32_t get_unused_page_num(Pager* pager) {
-    // Returns the current total number of pages, which will be the index of the next new page
+    // FREELIST OPTIMIZATION: Pop from free list if available
+    // TEMPORARILY DISABLED - debugging corruption issues
+    /*
+    if (pager->free_head != 0) {
+        uint32_t free_page = pager->free_head;
+        
+        // Read the next free page pointer from the first 4 bytes of the free page
+        void* page = pager_get_page(pager, free_page);
+        if (page != nullptr) {
+            uint32_t next_free;
+            memcpy(&next_free, page, sizeof(uint32_t));
+            pager->free_head = next_free;
+            
+            // Clear the page for reuse
+            memset(page, 0, PAGE_SIZE);
+            
+            return free_page;
+        }
+    }
+    */
+    
+    // No free pages available, allocate a new one
     return pager->num_pages;
+}
+
+void free_page(Pager* pager, uint32_t page_num) {
+    // FREELIST OPTIMIZATION: Add page to free list
+    if (pager == nullptr || page_num >= TABLE_MAX_PAGES) {
+        return;
+    }
+    
+    void* page = pager_get_page(pager, page_num);
+    if (page == nullptr) {
+        return;
+    }
+    
+    // Store the current free_head in the first 4 bytes of this page
+    memcpy(page, &pager->free_head, sizeof(uint32_t));
+    
+    // Make this page the new head of the free list
+    pager->free_head = page_num;
+    
+    // Flush the page to disk
+    pager_flush(pager, page_num);
 }
 
 // --- Table/Pager Functions  ---
@@ -218,9 +264,15 @@ void free_table(Table* table) {
     Pager* pager = table->pager;
 
     // Flush all cached pages
+    bool had_flush_error = false;
     for (int i = 0; i < pager->num_pages; i++) { // Iterate up to known num_pages
         if (pager->pages[i] != nullptr) {
-            pager_flush(pager, i);
+            PagerResult result = pager_flush(pager, i);
+            if (result != PAGER_SUCCESS) {
+                cout << "Warning: Failed to flush page " << i << ". Data may be lost." << endl;
+                had_flush_error = true;
+                // Don't exit - try to flush remaining pages
+            }
             delete[] static_cast<char*>(pager->pages[i]);
             pager->pages[i] = nullptr;
         }
@@ -228,16 +280,21 @@ void free_table(Table* table) {
 
      // --- WRITE FINAL HEADER ---
     if (pager->file_stream.is_open()) {
-        // Write the final root page number before closing
+        // Write the final header (root_page_num + free_head) before closing
         pager->file_stream.seekp(0);
         pager->file_stream.write(reinterpret_cast<char*>(&pager->root_page_num), sizeof(pager->root_page_num));
+        pager->file_stream.write(reinterpret_cast<char*>(&pager->free_head), sizeof(pager->free_head));
         if (pager->file_stream.fail()) {
              cout << "Error writing final header to database file." << endl;
              // Don't exit here, try to close file anyway
+             had_flush_error = true;
         }
         pager->file_stream.close();
     }
 
+    if (had_flush_error) {
+        cout << "Warning: Database close completed with errors." << endl;
+    }
 
     delete pager;
     delete table;
@@ -253,6 +310,9 @@ MetaCommandResult do_meta_command(InputBuffer* input_buffer, Table* table) {
     } else if (input_buffer->buffer == ".btree") {
         cout << "Tree:" << endl;
         print_tree(table);
+        return META_COMMAND_SUCCESS;
+    } else if (input_buffer->buffer == ".validate") {
+        validate_tree(table);
         return META_COMMAND_SUCCESS;
     } else if (input_buffer->buffer == ".constants") {
         cout << "Constants:" << endl;
@@ -495,16 +555,30 @@ uint32_t* get_internal_node_key(void* node, uint32_t key_num) {
     return reinterpret_cast<uint32_t*>(reinterpret_cast<char*>(child_ptr) + INTERNAL_NODE_CHILD_SIZE);
 }
 uint32_t get_node_max_key(Pager* pager, void* node) {
+    if (node == nullptr) {
+        cout << "Error: get_node_max_key called with nullptr" << endl;
+        return 0;
+    }
+    
     if (get_node_type(node) == NODE_LEAF) {
         // Handle empty leaf node case
         uint32_t num_cells = *get_leaf_node_num_cells(node);
-        if (num_cells == 0) return 0; // Or handle appropriately
+        if (num_cells == 0) {
+            cout << "Warning: Trying to get max key from empty leaf node" << endl;
+            return 0;
+        }
         return *get_leaf_node_key(node, num_cells - 1);
     } else {
-        void* right_child = pager_get_page(
-            pager,
-            *get_internal_node_right_child(node)
-        );
+        uint32_t right_child_page = *get_internal_node_right_child(node);
+        if (right_child_page >= TABLE_MAX_PAGES) {
+            cout << "Error: Invalid right child page number: " << right_child_page << endl;
+            return 0;
+        }
+        void* right_child = pager_get_page(pager, right_child_page);
+        if (right_child == nullptr) {
+            cout << "Error: Could not get right child page" << endl;
+            return 0;
+        }
         return get_node_max_key(pager, right_child);
     }
 }
@@ -535,6 +609,9 @@ uint32_t* get_node_parent(void* node) {
 
 Cursor* leaf_node_find(Table* table, uint32_t page_num, uint32_t key) {
     void* node = pager_get_page(table->pager, page_num);
+    if (node == nullptr) {
+        return nullptr;
+    }
     uint32_t num_cells = *get_leaf_node_num_cells(node);
 
     Cursor* cursor = new Cursor();
@@ -566,6 +643,9 @@ Cursor* leaf_node_find(Table* table, uint32_t page_num, uint32_t key) {
 Cursor* table_find(Table* table, uint32_t key) {
     uint32_t page_num = table->pager->root_page_num; // Use pager's root
     void* node = pager_get_page(table->pager, page_num);
+    if (node == nullptr) {
+        return nullptr;
+    }
 
     while (get_node_type(node) == NODE_INTERNAL) {
         uint32_t num_keys = *get_internal_node_num_keys(node);
@@ -589,6 +669,9 @@ Cursor* table_find(Table* table, uint32_t key) {
         }
 
         node = pager_get_page(table->pager, page_num);
+        if (node == nullptr) {
+            return nullptr;
+        }
     }
 
     return leaf_node_find(table, page_num, key);
@@ -596,13 +679,28 @@ Cursor* table_find(Table* table, uint32_t key) {
 
 Cursor* table_start(Table* table) {
     Cursor* cursor = table_find(table, 0); // Find starting from the correct root
+    if (cursor == nullptr) {
+        return nullptr;
+    }
     void* node = pager_get_page(table->pager, cursor->page_num);
-    cursor->end_of_table = (*get_leaf_node_num_cells(node) == 0);
+    if (node == nullptr) {
+        delete cursor;
+        return nullptr;
+    }
+    
+    // CRITICAL FIX: Handle empty root after merge
+    // If root is empty (all cells deleted), mark end_of_table
+    uint32_t num_cells = *get_leaf_node_num_cells(node);
+    cursor->end_of_table = (num_cells == 0);
+    
     return cursor;
 }
 
 void leaf_node_insert(Cursor* cursor, uint32_t key, Row* value) {
     void* node = pager_get_page(cursor->table->pager, cursor->page_num);
+    if (node == nullptr) {
+        return;
+    }
     uint32_t num_cells = *get_leaf_node_num_cells(node);
 
     if (cursor->cell_num < num_cells) {
@@ -619,11 +717,20 @@ void leaf_node_insert(Cursor* cursor, uint32_t key, Row* value) {
 
 void create_new_root(Table* table, uint32_t right_child_page_num) {
     void* root = pager_get_page(table->pager, table->pager->root_page_num); // Get current root
+    if (root == nullptr) {
+        return;
+    }
     uint32_t left_child_page_num = table->pager->root_page_num; // Old root becomes left child
     void* right_child = pager_get_page(table->pager, right_child_page_num);
+    if (right_child == nullptr) {
+        return;
+    }
 
     uint32_t new_root_page_num = get_unused_page_num(table->pager);
     void* new_root = pager_get_page(table->pager, new_root_page_num);
+    if (new_root == nullptr) {
+        return;
+    }
 
     initialize_internal_node(new_root);
     set_node_root(new_root, true);
@@ -647,19 +754,29 @@ void internal_node_split_and_insert(Table* table, uint32_t parent_page_num, uint
 void internal_node_insert(Table* table, uint32_t parent_page_num, uint32_t child_page_num) {
     // Add a new child/key pair to parent that corresponds to child
     void* parent = pager_get_page(table->pager, parent_page_num);
+    if (parent == nullptr) {
+        return;
+    }
     void* child = pager_get_page(table->pager, child_page_num);
+    if (child == nullptr) {
+        return;
+    }
     uint32_t child_max_key = get_node_max_key(table->pager, child);
-    uint32_t index = *get_internal_node_num_keys(parent);
+    uint32_t original_num_keys = *get_internal_node_num_keys(parent);
 
-    // Find where to insert the new key
-    for (uint32_t i = 0; i < index; i++) {
-        if (child_max_key < *get_internal_node_key(parent, i)) {
-            index = i;
-            break;
+    // Binary search to find insertion index
+    uint32_t min_index = 0;
+    uint32_t max_index = original_num_keys;
+    while (min_index != max_index) {
+        uint32_t mid = (min_index + max_index) / 2;
+        uint32_t key_at_mid = *get_internal_node_key(parent, mid);
+        if (child_max_key < key_at_mid) {
+            max_index = mid;
+        } else {
+            min_index = mid + 1;
         }
     }
-
-    uint32_t original_num_keys = *get_internal_node_num_keys(parent);
+    uint32_t index = min_index;
     
     // Check if the node needs to be split
     if (original_num_keys >= INTERNAL_NODE_MAX_KEYS) {
@@ -669,6 +786,9 @@ void internal_node_insert(Table* table, uint32_t parent_page_num, uint32_t child
 
     uint32_t right_child_page_num = *get_internal_node_right_child(parent);
     void* right_child = pager_get_page(table->pager, right_child_page_num);
+    if (right_child == nullptr) {
+        return;
+    }
 
     // If the new key is greater than all existing keys, update the right child
     if (child_max_key > get_node_max_key(table->pager, right_child)) {
@@ -690,16 +810,23 @@ void internal_node_insert(Table* table, uint32_t parent_page_num, uint32_t child
 
 void internal_node_split_and_insert(Table* table, uint32_t parent_page_num, uint32_t child_page_num) {
     void* old_node = pager_get_page(table->pager, parent_page_num);
+    if (old_node == nullptr) {
+        return;
+    }
     uint32_t old_num_keys = *get_internal_node_num_keys(old_node);
     
     // Create a new internal node
     uint32_t new_page_num = get_unused_page_num(table->pager);
     void* new_node = pager_get_page(table->pager, new_page_num);
+    if (new_node == nullptr) {
+        return;
+    }
     initialize_internal_node(new_node);
     
     // Allocate a temporary buffer to hold all keys and children including the new one
-    uint32_t* temp_keys = new uint32_t[INTERNAL_NODE_MAX_KEYS + 1];
-    uint32_t* temp_children = new uint32_t[INTERNAL_NODE_MAX_KEYS + 2];
+    // Zero-initialize to avoid garbage values
+    uint32_t* temp_keys = new uint32_t[INTERNAL_NODE_MAX_KEYS + 1]();
+    uint32_t* temp_children = new uint32_t[INTERNAL_NODE_MAX_KEYS + 2]();
     
     // Copy existing keys and children to temp arrays
     for (uint32_t i = 0; i < old_num_keys; i++) {
@@ -710,6 +837,11 @@ void internal_node_split_and_insert(Table* table, uint32_t parent_page_num, uint
     
     // Find where to insert the new child
     void* child = pager_get_page(table->pager, child_page_num);
+    if (child == nullptr) {
+        delete[] temp_keys;
+        delete[] temp_children;
+        return;
+    }
     uint32_t child_max_key = get_node_max_key(table->pager, child);
     uint32_t insert_index = old_num_keys;
     
@@ -740,7 +872,9 @@ void internal_node_split_and_insert(Table* table, uint32_t parent_page_num, uint
     *get_internal_node_right_child(old_node) = temp_children[split_at];
     
     // Populate new node with right half
-    uint32_t new_num_keys = old_num_keys - split_at;
+    // CRITICAL FIX: new_num_keys should be (old_num_keys + 1) - split_at
+    // because we inserted one new key into the temp array
+    uint32_t new_num_keys = (old_num_keys + 1) - split_at;
     *get_internal_node_num_keys(new_node) = new_num_keys;
     for (uint32_t i = 0; i < new_num_keys; i++) {
         *get_internal_node_child(new_node, i) = temp_children[split_at + 1 + i];
@@ -794,9 +928,15 @@ void internal_node_split_and_insert(Table* table, uint32_t parent_page_num, uint
 
 void leaf_node_split_and_insert(Cursor* cursor, uint32_t key, Row* value) {
     void* old_node = pager_get_page(cursor->table->pager, cursor->page_num);
+    if (old_node == nullptr) {
+        return;
+    }
 
     uint32_t new_page_num = get_unused_page_num(cursor->table->pager);
     void* new_node = pager_get_page(cursor->table->pager, new_page_num);
+    if (new_node == nullptr) {
+        return;
+    }
     initialize_leaf_node(new_node);
 
     uint32_t old_next = *get_leaf_node_next_leaf(old_node);
@@ -851,6 +991,9 @@ void leaf_node_split_and_insert(Cursor* cursor, uint32_t key, Row* value) {
 
 void leaf_node_delete(Cursor* cursor) {
     void* node = pager_get_page(cursor->table->pager, cursor->page_num);
+    if (node == nullptr) {
+        return;
+    }
     uint32_t num_cells = *get_leaf_node_num_cells(node);
 
     for (uint32_t i = cursor->cell_num; i < num_cells - 1; i++) {
@@ -860,6 +1003,573 @@ void leaf_node_delete(Cursor* cursor) {
     }
 
     *get_leaf_node_num_cells(node) -= 1;
+    
+    // Check for underflow (only if not root)
+    if (!is_node_root(node) && *get_leaf_node_num_cells(node) < LEAF_NODE_MIN_CELLS) {
+        handle_leaf_underflow(cursor->table, cursor->page_num);
+    }
+}
+
+// Helper: Find the index of a child in its parent
+int32_t find_child_index_in_parent(void* parent, uint32_t child_page_num) {
+    uint32_t num_keys = *get_internal_node_num_keys(parent);
+    
+    // Check right child first (common case for rightmost operations)
+    if (*get_internal_node_right_child(parent) == child_page_num) {
+        return num_keys; // Right child is at index num_keys
+    }
+    
+    // OPTIMIZATION: Use binary search for O(log n) instead of O(n)
+    // Note: Children may not be sorted by page number, so we use linear search
+    // A true optimization would require maintaining a sorted index
+    for (uint32_t i = 0; i < num_keys; i++) {
+        if (*get_internal_node_child(parent, i) == child_page_num) {
+            return i;
+        }
+    }
+    
+    return -1; // Not found
+}
+
+// Handle leaf node underflow by borrowing or merging
+void handle_leaf_underflow(Table* table, uint32_t page_num) {
+    // SAFETY: Comprehensive null guards
+    if (table == nullptr || table->pager == nullptr) {
+        cout << "Error: Null table or pager in handle_leaf_underflow" << endl;
+        return;
+    }
+    
+    void* node = pager_get_page(table->pager, page_num);
+    if (node == nullptr) {
+        cout << "Error: Could not load page " << page_num << " in handle_leaf_underflow" << endl;
+        return;
+    }
+    
+    uint32_t parent_page_num = *get_node_parent(node);
+    
+    // If this is root, no underflow handling needed (root can have fewer cells)
+    if (is_node_root(node)) {
+        return;
+    }
+    
+    void* parent = pager_get_page(table->pager, parent_page_num);
+    if (parent == nullptr) {
+        cout << "Error: Could not load parent page " << parent_page_num << " in handle_leaf_underflow" << endl;
+        return;
+    }
+    
+    int32_t child_index = find_child_index_in_parent(parent, page_num);
+    
+    if (child_index < 0) {
+        cout << "Error: Could not find child in parent during underflow handling" << endl;
+        return;
+    }
+    
+    uint32_t num_parent_keys = *get_internal_node_num_keys(parent);
+    
+    // Try to borrow from right sibling first
+    if ((uint32_t)child_index < num_parent_keys) {
+        uint32_t right_sibling_page_num;
+        if ((uint32_t)child_index == num_parent_keys - 1) {
+            right_sibling_page_num = *get_internal_node_right_child(parent);
+        } else {
+            right_sibling_page_num = *get_internal_node_child(parent, child_index + 1);
+        }
+        
+        void* right_sibling = pager_get_page(table->pager, right_sibling_page_num);
+        if (right_sibling == nullptr) {
+        } else {
+            uint32_t right_sibling_cells = *get_leaf_node_num_cells(right_sibling);
+            
+            // If right sibling has extra cells, borrow one
+            if (right_sibling_cells > LEAF_NODE_MIN_CELLS) {
+            // Move the first cell from right sibling to end of current node
+            uint32_t current_cells = *get_leaf_node_num_cells(node);
+            void* dest = get_leaf_node_cell(node, current_cells);
+            void* src = get_leaf_node_cell(right_sibling, 0);
+            memcpy(dest, src, LEAF_NODE_CELL_SIZE);
+            
+            // Shift cells in right sibling left
+            // CRITICAL FIX: Use memmove instead of memcpy for overlapping memory regions
+            for (uint32_t i = 0; i < right_sibling_cells - 1; i++) {
+                void* dest_sib = get_leaf_node_cell(right_sibling, i);
+                void* src_sib = get_leaf_node_cell(right_sibling, i + 1);
+                memmove(dest_sib, src_sib, LEAF_NODE_CELL_SIZE);
+            }
+            
+            *get_leaf_node_num_cells(node) = current_cells + 1;
+            *get_leaf_node_num_cells(right_sibling) = right_sibling_cells - 1;
+            
+            // CRITICAL FIX: Update parent key to the NEW first key of right sibling (borrowed key)
+            // not the new max of current node
+            *get_internal_node_key(parent, child_index) = *get_leaf_node_key(right_sibling, 0);
+            
+            return; // Successfully borrowed
+            }
+        }
+    }
+    
+    // Try to borrow from left sibling
+    if (child_index > 0) {
+        uint32_t left_sibling_page_num = *get_internal_node_child(parent, child_index - 1);
+        void* left_sibling = pager_get_page(table->pager, left_sibling_page_num);
+        if (left_sibling == nullptr) {
+        } else {
+            uint32_t left_sibling_cells = *get_leaf_node_num_cells(left_sibling);
+            
+            // If left sibling has extra cells, borrow one
+            if (left_sibling_cells > LEAF_NODE_MIN_CELLS) {
+            uint32_t current_cells = *get_leaf_node_num_cells(node);
+            
+            // Make room at the beginning of current node
+            // CRITICAL FIX: Use memmove instead of memcpy for overlapping memory regions
+            for (int32_t i = current_cells; i > 0; i--) {
+                void* dest = get_leaf_node_cell(node, i);
+                void* src = get_leaf_node_cell(node, i - 1);
+                memmove(dest, src, LEAF_NODE_CELL_SIZE);
+            }
+            
+            // Move last cell from left sibling to beginning of current node
+            void* dest = get_leaf_node_cell(node, 0);
+            void* src = get_leaf_node_cell(left_sibling, left_sibling_cells - 1);
+            memcpy(dest, src, LEAF_NODE_CELL_SIZE);
+            
+            *get_leaf_node_num_cells(node) = current_cells + 1;
+            *get_leaf_node_num_cells(left_sibling) = left_sibling_cells - 1;
+            
+            // Update parent key for left sibling
+            uint32_t new_left_max = get_node_max_key(table->pager, left_sibling);
+            *get_internal_node_key(parent, child_index - 1) = new_left_max;
+            
+            return; // Successfully borrowed
+            }
+        }
+    }
+    
+    // Cannot borrow - must merge with a sibling
+    // Prefer merging with left sibling if it exists
+    if (child_index > 0) {
+        // Merge with left sibling
+        uint32_t left_sibling_page_num = *get_internal_node_child(parent, child_index - 1);
+        void* left_sibling = pager_get_page(table->pager, left_sibling_page_num);
+        uint32_t left_cells = *get_leaf_node_num_cells(left_sibling);
+        uint32_t current_cells = *get_leaf_node_num_cells(node);
+        
+        // Copy all cells from current node to left sibling
+        for (uint32_t i = 0; i < current_cells; i++) {
+            void* dest = get_leaf_node_cell(left_sibling, left_cells + i);
+            void* src = get_leaf_node_cell(node, i);
+            memcpy(dest, src, LEAF_NODE_CELL_SIZE);
+        }
+        
+        *get_leaf_node_num_cells(left_sibling) = left_cells + current_cells;
+        
+        // Update next leaf pointer
+        *get_leaf_node_next_leaf(left_sibling) = *get_leaf_node_next_leaf(node);
+        
+        // CRITICAL FIX: Update left sibling's max key in parent BEFORE shifting
+        // Must do this before removing entries while indices are still correct
+        uint32_t new_left_max = get_node_max_key(table->pager, left_sibling);
+        if (child_index > 0) {
+            *get_internal_node_key(parent, child_index - 1) = new_left_max;
+        }
+        
+        // Remove current node's entry from parent
+        // Shift keys and children left
+        // CRITICAL FIX: Use memmove for safe overlapping memory operations
+        if (child_index < num_parent_keys - 1) {
+            // Shift children
+            memmove(get_internal_node_child(parent, child_index),
+                   get_internal_node_child(parent, child_index + 1),
+                   (num_parent_keys - child_index - 1) * sizeof(uint32_t));
+            // Shift keys
+            memmove(get_internal_node_key(parent, child_index),
+                   get_internal_node_key(parent, child_index + 1),
+                   (num_parent_keys - child_index - 1) * sizeof(uint32_t));
+        }
+        
+        // If we removed the last key, update child pointer
+        if ((uint32_t)child_index == num_parent_keys - 1) {
+            // The child at the removed position becomes the right child's old value
+            *get_internal_node_child(parent, num_parent_keys - 1) = *get_internal_node_right_child(parent);
+        }
+        
+        // Update parent key count
+        *get_internal_node_num_keys(parent) = num_parent_keys - 1;
+        
+        // CRITICAL FIX: After shifting, update all shifted keys to reflect their actual child max keys
+        // This is necessary because we just removed a node, and the keys may no longer be accurate
+        for (uint32_t i = child_index - 1; i < *get_internal_node_num_keys(parent); i++) {
+            uint32_t child_page = *get_internal_node_child(parent, i);
+            void* child_node = pager_get_page(table->pager, child_page);
+            if (child_node != nullptr) {
+                uint32_t child_max = get_node_max_key(table->pager, child_node);
+                *get_internal_node_key(parent, i) = child_max;
+            }
+        }
+        
+        // Special case: if parent is root and now has only 1 child
+        if (is_node_root(parent) && *get_internal_node_num_keys(parent) == 0) {
+            // The merged node becomes the new root
+            table->pager->root_page_num = left_sibling_page_num;
+            set_node_root(left_sibling, true);
+            *get_node_parent(left_sibling) = 0; // Root has no parent
+            // Safe to free now since parent is being replaced
+            free_page(table->pager, page_num);
+        } else if (!is_node_root(parent) && *get_internal_node_num_keys(parent) < INTERNAL_NODE_MIN_KEYS) {
+            // CRITICAL: Free BEFORE recursive call to avoid use-after-free
+            free_page(table->pager, page_num);
+            // Parent now has underflow - recursively handle it
+            handle_internal_underflow(table, parent_page_num);
+        } else {
+            // No underflow, safe to free
+            free_page(table->pager, page_num);
+        }
+        
+    } else {
+        // Must merge with right sibling (we are the leftmost child)
+        uint32_t right_sibling_page_num = *get_internal_node_child(parent, child_index + 1);
+        void* right_sibling = pager_get_page(table->pager, right_sibling_page_num);
+        uint32_t right_cells = *get_leaf_node_num_cells(right_sibling);
+        uint32_t current_cells = *get_leaf_node_num_cells(node);
+        
+        // Copy all cells from right sibling to current node
+        for (uint32_t i = 0; i < right_cells; i++) {
+            void* dest = get_leaf_node_cell(node, current_cells + i);
+            void* src = get_leaf_node_cell(right_sibling, i);
+            memcpy(dest, src, LEAF_NODE_CELL_SIZE);
+        }
+        
+        *get_leaf_node_num_cells(node) = current_cells + right_cells;
+        
+        // Update next leaf pointer
+        *get_leaf_node_next_leaf(node) = *get_leaf_node_next_leaf(right_sibling);
+        
+        // CRITICAL FIX: Update current node's max key in parent BEFORE shifting
+        // Must do this before removing entries while indices are still correct
+        uint32_t new_max = get_node_max_key(table->pager, node);
+        *get_internal_node_key(parent, child_index) = new_max;
+        
+        // Remove right sibling's entry from parent
+        // CRITICAL FIX: Use memmove for safe overlapping memory operations
+        if (child_index + 1 < num_parent_keys - 1) {
+            // Shift children
+            memmove(get_internal_node_child(parent, child_index + 1),
+                   get_internal_node_child(parent, child_index + 2),
+                   (num_parent_keys - child_index - 2) * sizeof(uint32_t));
+            // Shift keys
+            memmove(get_internal_node_key(parent, child_index + 1),
+                   get_internal_node_key(parent, child_index + 2),
+                   (num_parent_keys - child_index - 2) * sizeof(uint32_t));
+        }
+        
+        // Update right child
+        if (child_index + 1 == num_parent_keys - 1) {
+            // Right sibling was second to last, so right child becomes last child
+            *get_internal_node_child(parent, num_parent_keys - 1) = *get_internal_node_right_child(parent);
+        } else {
+            *get_internal_node_child(parent, num_parent_keys - 1) = *get_internal_node_right_child(parent);
+        }
+        
+        *get_internal_node_num_keys(parent) = num_parent_keys - 1;
+        
+        // CRITICAL FIX: After shifting, update all shifted keys to reflect their actual child max keys
+        for (uint32_t i = child_index; i < *get_internal_node_num_keys(parent); i++) {
+            uint32_t child_page = *get_internal_node_child(parent, i);
+            void* child_node = pager_get_page(table->pager, child_page);
+            if (child_node != nullptr) {
+                uint32_t child_max = get_node_max_key(table->pager, child_node);
+                *get_internal_node_key(parent, i) = child_max;
+            }
+        }
+        
+        // Special case: if parent is root and now has only 1 child
+        if (is_node_root(parent) && *get_internal_node_num_keys(parent) == 0) {
+            // The merged node becomes the new root
+            table->pager->root_page_num = page_num;
+            set_node_root(node, true);
+            *get_node_parent(node) = 0; // Root has no parent
+            // Safe to free now
+            free_page(table->pager, right_sibling_page_num);
+        } else if (!is_node_root(parent) && *get_internal_node_num_keys(parent) < INTERNAL_NODE_MIN_KEYS) {
+            // CRITICAL: Free BEFORE recursive call
+            free_page(table->pager, right_sibling_page_num);
+            // Parent now has underflow - recursively handle it
+            handle_internal_underflow(table, parent_page_num);
+        } else {
+            // No underflow, safe to free
+            free_page(table->pager, right_sibling_page_num);
+        }
+    }
+}
+
+// Handle internal node underflow by borrowing or merging
+void handle_internal_underflow(Table* table, uint32_t page_num) {
+    // SAFETY: Comprehensive null guards
+    if (table == nullptr || table->pager == nullptr) {
+        cout << "Error: Null table or pager in handle_internal_underflow" << endl;
+        return;
+    }
+    
+    void* node = pager_get_page(table->pager, page_num);
+    if (node == nullptr) {
+        cout << "Error: Could not load page " << page_num << " in handle_internal_underflow" << endl;
+        return;
+    }
+    
+    uint32_t parent_page_num = *get_node_parent(node);
+    
+    // If this is root, no underflow handling needed
+    if (is_node_root(node)) {
+        return;
+    }
+    
+    void* parent = pager_get_page(table->pager, parent_page_num);
+    if (parent == nullptr) {
+        cout << "Error: Could not load parent page " << parent_page_num << " in handle_internal_underflow" << endl;
+        return;
+    }
+    
+    int32_t child_index = find_child_index_in_parent(parent, page_num);
+    
+    if (child_index < 0) {
+        cout << "Error: Could not find child in parent during internal underflow handling" << endl;
+        return;
+    }
+    
+    uint32_t num_parent_keys = *get_internal_node_num_keys(parent);
+    uint32_t num_keys = *get_internal_node_num_keys(node);
+    
+    // Try to borrow from right sibling first
+    if ((uint32_t)child_index < num_parent_keys) {
+        uint32_t right_sibling_page_num;
+        if ((uint32_t)child_index == num_parent_keys - 1) {
+            right_sibling_page_num = *get_internal_node_right_child(parent);
+        } else {
+            right_sibling_page_num = *get_internal_node_child(parent, child_index + 1);
+        }
+        
+        void* right_sibling = pager_get_page(table->pager, right_sibling_page_num);
+        if (right_sibling != nullptr) {
+            uint32_t right_keys = *get_internal_node_num_keys(right_sibling);
+            
+            // If right sibling has extra keys, borrow one
+            if (right_keys > INTERNAL_NODE_MIN_KEYS) {
+                // Move first child and key from right sibling to end of current node
+                uint32_t borrowed_child = *get_internal_node_child(right_sibling, 0);
+                uint32_t borrowed_key = *get_internal_node_key(right_sibling, 0);
+                
+                // Add to current node
+                *get_internal_node_child(node, num_keys + 1) = *get_internal_node_right_child(node);
+                *get_internal_node_right_child(node) = borrowed_child;
+                *get_internal_node_key(node, num_keys) = get_node_max_key(table->pager, node);
+                *get_internal_node_num_keys(node) = num_keys + 1;
+                
+                // Update parent pointer of borrowed child
+                void* borrowed_child_node = pager_get_page(table->pager, borrowed_child);
+                if (borrowed_child_node != nullptr) {
+                    *get_node_parent(borrowed_child_node) = page_num;
+                }
+                
+                // Shift keys and children in right sibling left
+                // CRITICAL FIX: Use memmove for safe overlapping memory operations
+                if (right_keys > 1) {
+                    memmove(get_internal_node_child(right_sibling, 0),
+                           get_internal_node_child(right_sibling, 1),
+                           (right_keys - 1) * sizeof(uint32_t));
+                    memmove(get_internal_node_key(right_sibling, 0),
+                           get_internal_node_key(right_sibling, 1),
+                           (right_keys - 1) * sizeof(uint32_t));
+                }
+                *get_internal_node_child(right_sibling, right_keys - 1) = *get_internal_node_right_child(right_sibling);
+                *get_internal_node_num_keys(right_sibling) = right_keys - 1;
+                
+                // Update parent key
+                uint32_t new_max = get_node_max_key(table->pager, node);
+                *get_internal_node_key(parent, child_index) = new_max;
+                
+                return; // Successfully borrowed
+            }
+        }
+    }
+    
+    // Try to borrow from left sibling
+    if (child_index > 0) {
+        uint32_t left_sibling_page_num = *get_internal_node_child(parent, child_index - 1);
+        void* left_sibling = pager_get_page(table->pager, left_sibling_page_num);
+        if (left_sibling != nullptr) {
+            uint32_t left_keys = *get_internal_node_num_keys(left_sibling);
+            
+            // If left sibling has extra keys, borrow one
+            if (left_keys > INTERNAL_NODE_MIN_KEYS) {
+                // Make room at beginning of current node
+                // CRITICAL FIX: Use memmove for safe overlapping memory operations
+                if (num_keys > 0) {
+                    memmove(get_internal_node_child(node, 1),
+                           get_internal_node_child(node, 0),
+                           (num_keys + 1) * sizeof(uint32_t));
+                    memmove(get_internal_node_key(node, 1),
+                           get_internal_node_key(node, 0),
+                           num_keys * sizeof(uint32_t));
+                }
+                
+                // Borrow last key and child from left sibling
+                uint32_t borrowed_child = *get_internal_node_right_child(left_sibling);
+                uint32_t borrowed_key = get_node_max_key(table->pager, left_sibling);
+                
+                *get_internal_node_child(node, 0) = borrowed_child;
+                *get_internal_node_key(node, 0) = borrowed_key;
+                *get_internal_node_num_keys(node) = num_keys + 1;
+                
+                // Update parent pointer of borrowed child
+                void* borrowed_child_node = pager_get_page(table->pager, borrowed_child);
+                if (borrowed_child_node != nullptr) {
+                    *get_node_parent(borrowed_child_node) = page_num;
+                }
+                
+                // Update left sibling
+                *get_internal_node_right_child(left_sibling) = *get_internal_node_child(left_sibling, left_keys - 1);
+                *get_internal_node_num_keys(left_sibling) = left_keys - 1;
+                
+                // Update parent key for left sibling
+                uint32_t new_left_max = get_node_max_key(table->pager, left_sibling);
+                *get_internal_node_key(parent, child_index - 1) = new_left_max;
+                
+                return; // Successfully borrowed
+            }
+        }
+    }
+    
+    // Cannot borrow - must merge with a sibling
+    // Prefer merging with left sibling if it exists
+    if (child_index > 0) {
+        // Merge with left sibling
+        uint32_t left_sibling_page_num = *get_internal_node_child(parent, child_index - 1);
+        void* left_sibling = pager_get_page(table->pager, left_sibling_page_num);
+        uint32_t left_keys = *get_internal_node_num_keys(left_sibling);
+        
+        // Copy all keys and children from current node to left sibling
+        for (uint32_t i = 0; i < num_keys; i++) {
+            *get_internal_node_child(left_sibling, left_keys + 1 + i) = *get_internal_node_child(node, i);
+            *get_internal_node_key(left_sibling, left_keys + i) = *get_internal_node_key(node, i);
+            
+            // Update parent pointers
+            void* child = pager_get_page(table->pager, *get_internal_node_child(node, i));
+            if (child != nullptr) {
+                *get_node_parent(child) = left_sibling_page_num;
+            }
+        }
+        
+        // Copy right child
+        *get_internal_node_child(left_sibling, left_keys + num_keys + 1) = *get_internal_node_right_child(node);
+        void* right_child = pager_get_page(table->pager, *get_internal_node_right_child(node));
+        if (right_child != nullptr) {
+            *get_node_parent(right_child) = left_sibling_page_num;
+        }
+        
+        *get_internal_node_num_keys(left_sibling) = left_keys + num_keys;
+        *get_internal_node_right_child(left_sibling) = *get_internal_node_right_child(node);
+        
+        // CRITICAL FIX: Update left sibling's max key in parent BEFORE shifting
+        // This must be done before we remove entries, while indices are still correct
+        uint32_t new_left_max = get_node_max_key(table->pager, left_sibling);
+        if (child_index > 0) {
+            *get_internal_node_key(parent, child_index - 1) = new_left_max;
+        }
+        
+        // Remove current node's entry from parent
+        for (uint32_t i = child_index; i < num_parent_keys - 1; i++) {
+            *get_internal_node_child(parent, i) = *get_internal_node_child(parent, i + 1);
+            *get_internal_node_key(parent, i) = *get_internal_node_key(parent, i + 1);
+        }
+        
+        if ((uint32_t)child_index == num_parent_keys - 1) {
+            *get_internal_node_child(parent, child_index) = *get_internal_node_right_child(parent);
+        } else {
+            *get_internal_node_child(parent, num_parent_keys - 1) = *get_internal_node_right_child(parent);
+        }
+        
+        *get_internal_node_num_keys(parent) = num_parent_keys - 1;
+        
+        // Special case: if parent is root and now empty
+        if (is_node_root(parent) && *get_internal_node_num_keys(parent) == 0) {
+            table->pager->root_page_num = left_sibling_page_num;
+            set_node_root(left_sibling, true);
+            *get_node_parent(left_sibling) = 0;
+            // Safe to free now
+            free_page(table->pager, page_num);
+        } else if (!is_node_root(parent) && *get_internal_node_num_keys(parent) < INTERNAL_NODE_MIN_KEYS) {
+            // CRITICAL: Free BEFORE recursive call
+            free_page(table->pager, page_num);
+            // Recursively handle parent underflow
+            handle_internal_underflow(table, parent_page_num);
+        } else {
+            // No underflow, safe to free
+            free_page(table->pager, page_num);
+        }
+    } else {
+        // Merge with right sibling (we are the leftmost child)
+        uint32_t right_sibling_page_num = *get_internal_node_child(parent, child_index + 1);
+        void* right_sibling = pager_get_page(table->pager, right_sibling_page_num);
+        uint32_t right_keys = *get_internal_node_num_keys(right_sibling);
+        
+        // Copy all keys and children from right sibling to current node
+        for (uint32_t i = 0; i < right_keys; i++) {
+            *get_internal_node_child(node, num_keys + 1 + i) = *get_internal_node_child(right_sibling, i);
+            *get_internal_node_key(node, num_keys + i) = *get_internal_node_key(right_sibling, i);
+            
+            // Update parent pointers
+            void* child = pager_get_page(table->pager, *get_internal_node_child(right_sibling, i));
+            if (child != nullptr) {
+                *get_node_parent(child) = page_num;
+            }
+        }
+        
+        *get_internal_node_child(node, num_keys + right_keys + 1) = *get_internal_node_right_child(right_sibling);
+        void* rc = pager_get_page(table->pager, *get_internal_node_right_child(right_sibling));
+        if (rc != nullptr) {
+            *get_node_parent(rc) = page_num;
+        }
+        
+        *get_internal_node_num_keys(node) = num_keys + right_keys;
+        *get_internal_node_right_child(node) = *get_internal_node_right_child(right_sibling);
+        
+        // CRITICAL FIX: Update current node's max key in parent BEFORE shifting
+        // This must be done before we remove entries, while indices are still correct
+        uint32_t new_max = get_node_max_key(table->pager, node);
+        *get_internal_node_key(parent, child_index) = new_max;
+        
+        // Remove right sibling's entry from parent
+        for (uint32_t i = child_index + 1; i < num_parent_keys - 1; i++) {
+            *get_internal_node_child(parent, i) = *get_internal_node_child(parent, i + 1);
+            *get_internal_node_key(parent, i) = *get_internal_node_key(parent, i + 1);
+        }
+        
+        if (child_index + 1 == num_parent_keys - 1) {
+            *get_internal_node_child(parent, num_parent_keys - 1) = *get_internal_node_right_child(parent);
+        } else {
+            *get_internal_node_child(parent, num_parent_keys - 1) = *get_internal_node_right_child(parent);
+        }
+        
+        *get_internal_node_num_keys(parent) = num_parent_keys - 1;
+        
+        // Special case: if parent is root and now empty
+        if (is_node_root(parent) && *get_internal_node_num_keys(parent) == 0) {
+            table->pager->root_page_num = page_num;
+            set_node_root(node, true);
+            *get_node_parent(node) = 0;
+            // Safe to free now
+            free_page(table->pager, right_sibling_page_num);
+        } else if (!is_node_root(parent) && *get_internal_node_num_keys(parent) < INTERNAL_NODE_MIN_KEYS) {
+            // CRITICAL: Free BEFORE recursive call
+            free_page(table->pager, right_sibling_page_num);
+            // Recursively handle parent underflow
+            handle_internal_underflow(table, parent_page_num);
+        } else {
+            // No underflow, safe to free
+            free_page(table->pager, right_sibling_page_num);
+        }
+    }
 }
 
 // --- Helper function to print a row  ---
@@ -869,44 +1579,92 @@ void print_row(Row* row) {
          << row->email << ")" << endl;
 }
 
+// --- Helper struct for key lookup ---
+struct KeyLocation {
+    Cursor* cursor;
+    void* node;
+    bool key_found;
+};
+
+// Helper function to find a key and check if it exists
+KeyLocation find_key_location(Table* table, uint32_t key) {
+    Cursor* cursor = table_find(table, key);
+    if (cursor == nullptr) {
+        return {nullptr, nullptr, false};
+    }
+    void* node = pager_get_page(table->pager, cursor->page_num);
+    
+    bool found = false;
+    if (node != nullptr) {
+        uint32_t num_cells = *get_leaf_node_num_cells(node);
+        if (cursor->cell_num < num_cells) {
+            uint32_t key_at_index = *get_leaf_node_key(node, cursor->cell_num);
+            if (key_at_index == key) {
+                found = true;
+            }
+        }
+    }
+    
+    return {cursor, node, found};
+}
+
 // --- Executor Functions ---
 // (No changes needed, uses table_find which uses pager->root_page_num)
 ExecuteResult execute_insert(Statement* statement, Table* table) {
+    // SAFETY: Comprehensive null guards
+    if (statement == nullptr || table == nullptr) {
+        cout << "Error: Null statement or table in execute_insert" << endl;
+        return EXECUTE_PAGE_OUT_OF_BOUNDS;
+    }
+    
     Row* row_to_insert = &(statement->row_to_insert);
     uint32_t key = row_to_insert->id;
 
-    Cursor* cursor = table_find(table, key);
-
-    void* node = pager_get_page(table->pager, cursor->page_num);
-    uint32_t num_cells = *get_leaf_node_num_cells(node);
-
-    if (cursor->cell_num < num_cells) {
-        uint32_t key_at_index = *get_leaf_node_key(node, cursor->cell_num);
-        if (key_at_index == key) {
-            delete cursor;
-            return EXECUTE_DUPLICATE_KEY;
-        }
+    KeyLocation loc = find_key_location(table, key);
+    
+    if (loc.cursor == nullptr || loc.node == nullptr) {
+        if (loc.cursor) delete loc.cursor;
+        return EXECUTE_PAGE_OUT_OF_BOUNDS;
+    }
+    
+    if (loc.key_found) {
+        delete loc.cursor;
+        return EXECUTE_DUPLICATE_KEY;
     }
 
+    uint32_t num_cells = *get_leaf_node_num_cells(loc.node);
     if (num_cells >= LEAF_NODE_MAX_CELLS) {
-        leaf_node_split_and_insert(cursor, key, row_to_insert);
-        delete cursor;
+        leaf_node_split_and_insert(loc.cursor, key, row_to_insert);
+        delete loc.cursor;
         return EXECUTE_SUCCESS;
     }
 
-    leaf_node_insert(cursor, key, row_to_insert);
-
-    delete cursor;
+    leaf_node_insert(loc.cursor, key, row_to_insert);
+    delete loc.cursor;
     return EXECUTE_SUCCESS;
 }
 
 ExecuteResult execute_select(Statement* statement, Table* table) {
+    // SAFETY: Comprehensive null guards
+    if (table == nullptr) {
+        cout << "Error: Null table in execute_select" << endl;
+        return EXECUTE_PAGE_OUT_OF_BOUNDS;
+    }
+    
     Cursor* cursor = table_start(table);
+    if (cursor == nullptr) {
+        cout << "Error: Could not create cursor in execute_select" << endl;
+        return EXECUTE_PAGE_OUT_OF_BOUNDS;
+    }
     Row row;
     uint32_t count = 0;
 
     while(!cursor->end_of_table) {
         void* leaf_node = pager_get_page(table->pager, cursor->page_num);
+        if (leaf_node == nullptr) {
+            delete cursor;
+            return EXECUTE_PAGE_OUT_OF_BOUNDS;
+        }
         uint32_t num_cells = *get_leaf_node_num_cells(leaf_node);
 
         while(cursor->cell_num < num_cells) {
@@ -932,71 +1690,90 @@ ExecuteResult execute_select(Statement* statement, Table* table) {
 }
 
 ExecuteResult execute_find(Statement* statement, Table* table) {
+    // SAFETY: Comprehensive null guards
+    if (statement == nullptr || table == nullptr) {
+        cout << "Error: Null statement or table in execute_find" << endl;
+        return EXECUTE_PAGE_OUT_OF_BOUNDS;
+    }
+    
     uint32_t key_to_find = statement->row_to_insert.id;
-    Cursor* cursor = table_find(table, key_to_find);
+    KeyLocation loc = find_key_location(table, key_to_find);
 
-    void* node = pager_get_page(table->pager, cursor->page_num);
-    uint32_t num_cells = *get_leaf_node_num_cells(node);
-
-    if (cursor->cell_num < num_cells) {
-        uint32_t key_at_index = *get_leaf_node_key(node, cursor->cell_num);
-        if (key_at_index == key_to_find) {
-            Row row;
-            void* value = get_leaf_node_value(node, cursor->cell_num);
-            deserialize_row(value, &row);
-            print_row(&row);
-
-            delete cursor;
-            return EXECUTE_SUCCESS;
-        }
+    if (loc.cursor == nullptr || loc.node == nullptr) {
+        if (loc.cursor) delete loc.cursor;
+        return EXECUTE_PAGE_OUT_OF_BOUNDS;
     }
 
-    delete cursor;
+    if (loc.key_found) {
+        Row row;
+        deserialize_row(get_leaf_node_value(loc.node, loc.cursor->cell_num), &row);
+        print_row(&row);
+        delete loc.cursor;
+        return EXECUTE_SUCCESS;
+    }
+
+    delete loc.cursor;
     return EXECUTE_RECORD_NOT_FOUND;
 }
 
 ExecuteResult execute_delete(Statement* statement, Table* table) {
+    // SAFETY: Comprehensive null guards
+    if (statement == nullptr || table == nullptr) {
+        cout << "Error: Null statement or table in execute_delete" << endl;
+        return EXECUTE_PAGE_OUT_OF_BOUNDS;
+    }
+    
     uint32_t key_to_delete = statement->row_to_insert.id;
-    Cursor* cursor = table_find(table, key_to_delete);
+    KeyLocation loc = find_key_location(table, key_to_delete);
 
-    void* node = pager_get_page(table->pager, cursor->page_num);
-    uint32_t num_cells = *get_leaf_node_num_cells(node);
-
-    if (cursor->cell_num < num_cells) {
-        uint32_t key_at_index = *get_leaf_node_key(node, cursor->cell_num);
-        if (key_at_index == key_to_delete) {
-            leaf_node_delete(cursor);
-            delete cursor;
-            return EXECUTE_SUCCESS;
-        }
+    if (loc.cursor == nullptr || loc.node == nullptr) {
+        if (loc.cursor) delete loc.cursor;
+        return EXECUTE_PAGE_OUT_OF_BOUNDS;
     }
 
-    delete cursor;
+    if (loc.key_found) {
+        leaf_node_delete(loc.cursor);
+        delete loc.cursor;
+        return EXECUTE_SUCCESS;
+    }
+
+    delete loc.cursor;
     return EXECUTE_RECORD_NOT_FOUND;
 }
 
 ExecuteResult execute_update(Statement* statement, Table* table) {
+    // SAFETY: Comprehensive null guards
+    if (statement == nullptr || table == nullptr) {
+        cout << "Error: Null statement or table in execute_update" << endl;
+        return EXECUTE_PAGE_OUT_OF_BOUNDS;
+    }
+    
     uint32_t key_to_update = statement->row_to_insert.id;
-    Cursor* cursor = table_find(table, key_to_update);
+    KeyLocation loc = find_key_location(table, key_to_update);
 
-    void* node = pager_get_page(table->pager, cursor->page_num);
-    uint32_t num_cells = *get_leaf_node_num_cells(node);
-
-    if (cursor->cell_num < num_cells) {
-        uint32_t key_at_index = *get_leaf_node_key(node, cursor->cell_num);
-        if (key_at_index == key_to_update) {
-            Row* row_to_update = &(statement->row_to_insert);
-            serialize_row(row_to_update, get_leaf_node_value(node, cursor->cell_num));
-            delete cursor;
-            return EXECUTE_SUCCESS;
-        }
+    if (loc.cursor == nullptr || loc.node == nullptr) {
+        if (loc.cursor) delete loc.cursor;
+        return EXECUTE_PAGE_OUT_OF_BOUNDS;
     }
 
-    delete cursor;
+    if (loc.key_found) {
+        Row* row_to_update = &(statement->row_to_insert);
+        serialize_row(row_to_update, get_leaf_node_value(loc.node, loc.cursor->cell_num));
+        delete loc.cursor;
+        return EXECUTE_SUCCESS;
+    }
+
+    delete loc.cursor;
     return EXECUTE_RECORD_NOT_FOUND;
 }
 
 ExecuteResult execute_range(Statement* statement, Table* table) {
+    // SAFETY: Comprehensive null guards
+    if (statement == nullptr || table == nullptr) {
+        cout << "Error: Null statement or table in execute_range" << endl;
+        return EXECUTE_PAGE_OUT_OF_BOUNDS;
+    }
+    
     uint32_t start_key = statement->range_start;
     uint32_t end_key = statement->range_end;
 
@@ -1006,11 +1783,19 @@ ExecuteResult execute_range(Statement* statement, Table* table) {
     }
 
     Cursor* cursor = table_find(table, start_key);
+    if (cursor == nullptr) {
+        cout << "Error: Could not create cursor in execute_range" << endl;
+        return EXECUTE_PAGE_OUT_OF_BOUNDS;
+    }
     Row row;
     uint32_t count = 0;
 
     while(!cursor->end_of_table) {
         void* leaf_node = pager_get_page(table->pager, cursor->page_num);
+        if (leaf_node == nullptr) {
+            delete cursor;
+            return EXECUTE_PAGE_OUT_OF_BOUNDS;
+        }
         uint32_t num_cells = *get_leaf_node_num_cells(leaf_node);
 
         while(cursor->cell_num < num_cells) {
@@ -1064,9 +1849,146 @@ ExecuteResult execute_statement(Statement* statement, Table* table) {
     return EXECUTE_SUCCESS;
 }
 
+// SAFETY: Tree validation function with asserts
+bool validate_tree_node(Pager* pager, uint32_t page_num, uint32_t* min_key, uint32_t* max_key, int* depth, bool is_root_call) {
+    if (pager == nullptr) {
+        cout << "ERROR: Null pager in validate_tree_node" << endl;
+        return false;
+    }
+    
+    void* node = pager_get_page(pager, page_num);
+    if (node == nullptr) {
+        cout << "ERROR: Cannot load page " << page_num << endl;
+        return false;
+    }
+    
+    if (get_node_type(node) == NODE_LEAF) {
+        uint32_t num_cells = *get_leaf_node_num_cells(node);
+        
+        // Check cell count bounds
+        if (num_cells > LEAF_NODE_MAX_CELLS) {
+            cout << "ERROR: Leaf page " << page_num << " has too many cells: " << num_cells << endl;
+            return false;
+        }
+        
+        // Check minimum cells (except for root)
+        if (!is_node_root(node) && num_cells < LEAF_NODE_MIN_CELLS) {
+            cout << "ERROR: Non-root leaf page " << page_num << " has too few cells: " << num_cells << " (min: " << LEAF_NODE_MIN_CELLS << ")" << endl;
+            return false;
+        }
+        
+        // Check keys are sorted
+        for (uint32_t i = 1; i < num_cells; i++) {
+            uint32_t prev_key = *get_leaf_node_key(node, i - 1);
+            uint32_t curr_key = *get_leaf_node_key(node, i);
+            if (prev_key >= curr_key) {
+                cout << "ERROR: Leaf page " << page_num << " has unsorted keys at index " << i - 1 << "-" << i << ": " << prev_key << " >= " << curr_key << endl;
+                return false;
+            }
+        }
+        
+        // Set min/max for this leaf
+        if (num_cells > 0) {
+            if (min_key) *min_key = *get_leaf_node_key(node, 0);
+            if (max_key) *max_key = *get_leaf_node_key(node, num_cells - 1);
+        }
+        
+        *depth = 0;
+        return true;
+        
+    } else { // Internal node
+        uint32_t num_keys = *get_internal_node_num_keys(node);
+        
+        // Check key count bounds
+        if (num_keys > INTERNAL_NODE_MAX_KEYS) {
+            cout << "ERROR: Internal page " << page_num << " has too many keys: " << num_keys << endl;
+            return false;
+        }
+        
+        // Check minimum keys (except for root)
+        if (!is_node_root(node) && num_keys < INTERNAL_NODE_MIN_KEYS) {
+            cout << "ERROR: Non-root internal page " << page_num << " has too few keys: " << num_keys << " (min: " << INTERNAL_NODE_MIN_KEYS << ")" << endl;
+            return false;
+        }
+        
+        // Validate all children and check uniform depth
+        int first_child_depth = -1;
+        uint32_t prev_max = 0;
+        
+        for (uint32_t i = 0; i <= num_keys; i++) {
+            uint32_t child_page_num = (i == num_keys) ? 
+                *get_internal_node_right_child(node) : 
+                *get_internal_node_child(node, i);
+            
+            uint32_t child_min, child_max;
+            int child_depth;
+            
+            if (!validate_tree_node(pager, child_page_num, &child_min, &child_max, &child_depth, false)) {
+                return false;
+            }
+            
+            // Check uniform depth
+            if (first_child_depth == -1) {
+                first_child_depth = child_depth;
+            } else if (child_depth != first_child_depth) {
+                cout << "ERROR: Internal page " << page_num << " has children at different depths" << endl;
+                return false;
+            }
+            
+            // Check keys are sorted relative to children
+            if (i > 0 && child_min <= prev_max) {
+                cout << "ERROR: Internal page " << page_num << " has overlapping child ranges" << endl;
+                return false;
+            }
+            
+            prev_max = child_max;
+            
+            // For non-rightmost children, verify the key separator
+            if (i < num_keys) {
+                uint32_t separator_key = *get_internal_node_key(node, i);
+                if (separator_key < child_max) {
+                    cout << "ERROR: Internal page " << page_num << " key[" << i << "]=" << separator_key << " is less than child max=" << child_max << endl;
+                    return false;
+                }
+            }
+        }
+        
+        if (min_key) *min_key = prev_max; // Will be set by first child
+        if (max_key) *max_key = prev_max;
+        *depth = first_child_depth + 1;
+        return true;
+    }
+}
+
+void validate_tree(Table* table) {
+    if (table == nullptr || table->pager == nullptr) {
+        cout << "ERROR: Null table or pager in validate_tree" << endl;
+        return;
+    }
+    
+    cout << "=== Validating B-Tree ===" << endl;
+    uint32_t min_key, max_key;
+    int depth;
+    
+    bool valid = validate_tree_node(table->pager, table->pager->root_page_num, &min_key, &max_key, &depth, true);
+    
+    if (valid) {
+        cout << "✓ Tree is valid! Depth: " << depth << endl;
+    } else {
+        cout << "✗ Tree validation FAILED!" << endl;
+    }
+}
+
 // NEW: Tree visualization functions
 void print_node(Pager* pager, uint32_t page_num, uint32_t indent_level) {
     void* node = pager_get_page(pager, page_num);
+    if (node == nullptr) {
+        for (uint32_t i = 0; i < indent_level; i++) {
+            cout << "  ";
+        }
+        cout << "- ERROR: Cannot access page " << page_num << endl;
+        return;
+    }
     uint32_t num_keys;
 
     for (uint32_t i = 0; i < indent_level; i++) {
@@ -1122,7 +2044,7 @@ int main(int argc, char* argv[]) {
     Table* table = new_table(filename);
     InputBuffer* input_buffer = new_input_buffer();
 
-    cout << "Enhanced SQLite Clone - Type '.exit' to quit, '.btree' to visualize tree" << endl;
+    cout << "Enhanced SQLite Clone - Commands: .exit | .btree | .validate" << endl;
 
     while (true) {
         print_prompt();
@@ -1169,6 +2091,12 @@ int main(int argc, char* argv[]) {
                 break;
             case (EXECUTE_RECORD_NOT_FOUND):
                 cout << "Error: Record not found." << endl;
+                break;
+            case (EXECUTE_DISK_ERROR):
+                cout << "Error: Disk I/O error. Check disk space and permissions." << endl;
+                break;
+            case (EXECUTE_PAGE_OUT_OF_BOUNDS):
+                cout << "Error: Page out of bounds. Database may be too large." << endl;
                 break;
         }
     }

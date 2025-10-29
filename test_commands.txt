@@ -1,6 +1,0 @@
-insert 1 user1 user1@example.com
-insert 2 user2 user2@example.com
-insert 3 user3 user3@example.com
-select
-.btree
-.exit

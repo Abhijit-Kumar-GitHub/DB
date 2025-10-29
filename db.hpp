@@ -13,7 +13,7 @@
 #include <iomanip>
 
 // --- Constants ---
-#define DB_FILE_HEADER_SIZE 4 // To store root_page_num
+#define DB_FILE_HEADER_SIZE 8 // root_page_num (4 bytes) + free_head (4 bytes)
 
 // --- Data Structures ---
 
@@ -67,6 +67,7 @@ typedef struct {
   void* pages[TABLE_MAX_PAGES];
   uint32_t num_pages;
   uint32_t root_page_num; // <<<--- MOVED HERE FROM TABLE
+  uint32_t free_head;     // Head of free page list (0 = no free pages)
 } Pager;
 
 // --- TABLE STRUCT ---
@@ -101,8 +102,19 @@ typedef enum {
   EXECUTE_SUCCESS,
   EXECUTE_TABLE_FULL,
   EXECUTE_DUPLICATE_KEY,
-  EXECUTE_RECORD_NOT_FOUND
+  EXECUTE_RECORD_NOT_FOUND,
+  EXECUTE_DISK_ERROR,
+  EXECUTE_PAGE_OUT_OF_BOUNDS
 } ExecuteResult;
+
+// Pager-specific result codes
+typedef enum {
+  PAGER_SUCCESS,
+  PAGER_DISK_ERROR,
+  PAGER_OUT_OF_BOUNDS,
+  PAGER_CORRUPT_FILE,
+  PAGER_NULL_PAGE
+} PagerResult;
 
 // --- B-TREE NODE CONSTANTS ---
 
@@ -130,6 +142,7 @@ typedef enum { NODE_INTERNAL, NODE_LEAF } NodeType;
 #define LEAF_NODE_CELL_SIZE (LEAF_NODE_KEY_SIZE + LEAF_NODE_VALUE_SIZE)
 #define LEAF_NODE_SPACE_FOR_CELLS (PAGE_SIZE - LEAF_NODE_HEADER_SIZE)
 #define LEAF_NODE_MAX_CELLS (LEAF_NODE_SPACE_FOR_CELLS / LEAF_NODE_CELL_SIZE)
+#define LEAF_NODE_MIN_CELLS (LEAF_NODE_MAX_CELLS / 2) // Minimum cells for rebalancing
 
 // Internal Node Header Layout
 #define INTERNAL_NODE_NUM_KEYS_SIZE sizeof(uint32_t)
@@ -144,6 +157,7 @@ typedef enum { NODE_INTERNAL, NODE_LEAF } NodeType;
 #define INTERNAL_NODE_CELL_SIZE (INTERNAL_NODE_CHILD_SIZE + INTERNAL_NODE_KEY_SIZE)
 #define INTERNAL_NODE_SPACE_FOR_CELLS (PAGE_SIZE - INTERNAL_NODE_HEADER_SIZE)
 #define INTERNAL_NODE_MAX_KEYS (INTERNAL_NODE_SPACE_FOR_CELLS / INTERNAL_NODE_CELL_SIZE)
+#define INTERNAL_NODE_MIN_KEYS (INTERNAL_NODE_MAX_KEYS / 2) // Minimum keys for rebalancing
 
 // --- Function Prototypes ---
 
@@ -165,8 +179,9 @@ void deserialize_row(void* source, Row* destination);
 // Pager functions
 Pager* pager_open(const std::string& filename);
 void* pager_get_page(Pager* pager, uint32_t page_num);
-void pager_flush(Pager* pager, uint32_t page_num);
+PagerResult pager_flush(Pager* pager, uint32_t page_num);
 uint32_t get_unused_page_num(Pager* pager);
+void free_page(Pager* pager, uint32_t page_num);
 
 // B-Tree Node Accessor functions
 uint32_t* get_leaf_node_num_cells(void* node);
@@ -197,6 +212,8 @@ void leaf_node_insert(Cursor* cursor, uint32_t key, Row* value);
 void create_new_root(Table* table, uint32_t right_child_page_num);
 void leaf_node_split_and_insert(Cursor* cursor, uint32_t key, Row* value);
 void leaf_node_delete(Cursor* cursor);
+void handle_leaf_underflow(Table* table, uint32_t page_num);
+void handle_internal_underflow(Table* table, uint32_t page_num);
 void update_internal_node_key(void* node, uint32_t old_max, uint32_t new_max);
 
 // Executor functions
@@ -215,5 +232,9 @@ void print_row(Row* row);
 // Visualization functions
 void print_tree(Table* table);
 void print_node(Pager* pager, uint32_t page_num, uint32_t indent_level);
+
+// Validation functions
+void validate_tree(Table* table);
+bool validate_tree_node(Pager* pager, uint32_t page_num, uint32_t* min_key, uint32_t* max_key, int* depth, bool is_root_call);
 
 #endif //DB_HPP
