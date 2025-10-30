@@ -1,0 +1,4 @@
+select
+.btree
+.validate
+.exit

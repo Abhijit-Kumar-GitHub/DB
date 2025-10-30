@@ -6,6 +6,9 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <map>
+#include <list>
+#include <set>
 #include <cstdlib>
 #include <cstring>
 #include <sstream>
@@ -64,10 +67,16 @@ typedef struct {
 typedef struct {
   std::fstream file_stream;
   uint32_t file_length;
-  void* pages[TABLE_MAX_PAGES];
-  uint32_t num_pages;
   uint32_t root_page_num; // <<<--- MOVED HERE FROM TABLE
-  uint32_t free_head;     // Head of free page list (0 = no free pages)
+  uint32_t free_head;     // Head of free page list (0 = no free pages) - kept for file header compatibility
+  // LRU Cache
+// Use macro for cache size instead of static member
+#define PAGER_CACHE_SIZE 100
+  std::map<uint32_t, void*> page_cache;
+  std::list<uint32_t> lru_list;
+  std::map<uint32_t, std::list<uint32_t>::iterator> lru_map;
+  // Track dirty pages for flush (optional, not implemented here)
+  uint32_t num_pages; // Keep for compatibility, but update logic in code
 } Pager;
 
 // --- TABLE STRUCT ---
@@ -198,7 +207,7 @@ uint32_t* get_node_parent(void* node);
 void initialize_internal_node(void* node);
 uint32_t* get_internal_node_num_keys(void* node);
 uint32_t* get_internal_node_right_child(void* node);
-uint32_t* get_internal_node_child(void* node, uint32_t child_num);
+uint32_t* get_internal_node_child(void* node, uint32_t child_num); // Returns nullptr if out of bounds
 uint32_t* get_internal_node_key(void* node, uint32_t key_num);
 uint32_t get_node_max_key(Pager* pager, void* node);
 

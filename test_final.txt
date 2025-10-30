@@ -1,0 +1,13 @@
+insert 100 final1 final1@email.com
+insert 101 final2 final2@email.com
+insert 102 final3 final3@email.com
+select
+delete 101
+select
+.btree
+insert 103 final4 final4@email.com
+range 100 102
+update 100 updated updated@email.com
+find 100
+.validate
+.exit

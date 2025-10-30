@@ -88,9 +88,7 @@ Pager* pager_open(const string& filename) {
     }
 
 
-    for (int i = 0; i < TABLE_MAX_PAGES; i++) {
-        pager->pages[i] = nullptr;
-    }
+    // No need to initialize pages array; page_cache starts empty
     return pager;
 }
 
@@ -103,113 +101,155 @@ uint64_t get_page_file_offset(uint32_t page_num) {
 void* pager_get_page(Pager* pager, uint32_t page_num) {
     if (page_num >= TABLE_MAX_PAGES) {
         cout << "Error: Tried to access page number out of bounds: " << page_num << endl;
-        return nullptr; // Return nullptr instead of exit
+        return nullptr;
     }
 
-    if (pager->pages[page_num] != nullptr) {
-        return pager->pages[page_num];
+    // LRU Cache logic
+    if (pager->page_cache.count(page_num)) {
+        // Cache hit: move to front (MRU)
+        pager->lru_list.erase(pager->lru_map[page_num]);
+        pager->lru_list.push_front(page_num);
+        pager->lru_map[page_num] = pager->lru_list.begin();
+        return pager->page_cache[page_num];
     }
 
-    void* page = new char[PAGE_SIZE];
-    memset(page, 0, PAGE_SIZE);
+    // Cache miss: evict if full
+    if (pager->page_cache.size() >= PAGER_CACHE_SIZE) {
+        uint32_t lru_page_num = pager->lru_list.back();
+        void* lru_page_data = pager->page_cache[lru_page_num];
+        pager_flush(pager, lru_page_num);
+        pager->lru_list.pop_back();
+        pager->lru_map.erase(lru_page_num);
+        delete[] static_cast<char*>(lru_page_data);
+        pager->page_cache.erase(lru_page_num);
+    }
 
-    // If page_num is beyond the current number of pages, it's a new page
-    // We update num_pages when we allocate, not just read
+    // Load page from disk
+    void* new_page = new char[PAGE_SIZE];
+    memset(new_page, 0, PAGE_SIZE);
+    uint64_t file_offset = get_page_file_offset(page_num);
     uint32_t current_num_pages = (pager->file_length - DB_FILE_HEADER_SIZE) / PAGE_SIZE;
-    if (page_num >= current_num_pages) {
-         // This is a new page being allocated logically
-         // num_pages gets updated when the page is flushed if it increases file size
-    } else {
-        // Page exists in file, read it from disk
-        pager->file_stream.seekg(get_page_file_offset(page_num));
-        pager->file_stream.read(static_cast<char*>(page), PAGE_SIZE);
-
-        if (pager->file_stream.fail() && !pager->file_stream.eof()) {
+    if (page_num < current_num_pages) {
+        pager->file_stream.seekg(file_offset);
+        pager->file_stream.read(static_cast<char*>(new_page), PAGE_SIZE);
+        if (pager->file_stream.fail()) {
             cout << "Error: Failed to read page " << page_num << " from file." << endl;
-            delete[] static_cast<char*>(page);
-            return nullptr; // Return nullptr instead of exit
+            delete[] static_cast<char*>(new_page);
+            return nullptr;
         }
-        // Clear fail bits if we only hit EOF (reading partial last page is ok conceptually, though our format assumes full pages)
         if (pager->file_stream.eof()) {
             pager->file_stream.clear();
         }
     }
-
-    pager->pages[page_num] = page;
+    // Add to cache (MRU)
+    pager->page_cache[page_num] = new_page;
+    pager->lru_list.push_front(page_num);
+    pager->lru_map[page_num] = pager->lru_list.begin();
     // Update num_pages if this is the highest page number seen so far
     if (page_num >= pager->num_pages) {
-         pager->num_pages = page_num + 1;
+        pager->num_pages = page_num + 1;
     }
-
-    return page;
+    return new_page;
 }
 
 PagerResult pager_flush(Pager* pager, uint32_t page_num) {
-    if (pager->pages[page_num] == nullptr) {
+    // Use page_cache instead of pages array
+    if (pager->page_cache.count(page_num) == 0) {
         return PAGER_NULL_PAGE;
     }
-
+    void* page_data = pager->page_cache[page_num];
     pager->file_stream.seekp(get_page_file_offset(page_num));
-    pager->file_stream.write(static_cast<char*>(pager->pages[page_num]), PAGE_SIZE);
-
+    pager->file_stream.write(static_cast<char*>(page_data), PAGE_SIZE);
     if (pager->file_stream.fail()) {
         return PAGER_DISK_ERROR;
     }
-
     // Ensure file_length is updated if we wrote a new page
     uint64_t expected_length = get_page_file_offset(page_num) + PAGE_SIZE;
     if (expected_length > pager->file_length) {
         pager->file_length = expected_length;
-        // Implicitly, pager->num_pages should reflect this, ensured by pager_get_page
     }
-    
     return PAGER_SUCCESS;
 }
 
-uint32_t get_unused_page_num(Pager* pager) {
-    // FREELIST OPTIMIZATION: Pop from free list if available
-    // TEMPORARILY DISABLED - debugging corruption issues
-    /*
-    if (pager->free_head != 0) {
-        uint32_t free_page = pager->free_head;
+// Validate freelist: Check for cycles and invalid page numbers
+bool validate_free_chain(Pager* pager) {
+    if (pager->free_head == 0) {
+        return true; // Empty freelist is valid
+    }
+    
+    // Use a set to detect cycles - if we see a page twice, there's a cycle
+    std::set<uint32_t> visited;
+    uint32_t current = pager->free_head;
+    
+    while (current != 0) {
+        // Check for invalid page number
+        if (current >= TABLE_MAX_PAGES) {
+            cout << "ERROR: Freelist contains invalid page number " << current << endl;
+            return false;
+        }
         
-        // Read the next free page pointer from the first 4 bytes of the free page
-        void* page = pager_get_page(pager, free_page);
-        if (page != nullptr) {
-            uint32_t next_free;
-            memcpy(&next_free, page, sizeof(uint32_t));
-            pager->free_head = next_free;
-            
-            // Clear the page for reuse
-            memset(page, 0, PAGE_SIZE);
-            
-            return free_page;
+        // Check for cycle
+        if (visited.find(current) != visited.end()) {
+            cout << "ERROR: Freelist contains cycle at page " << current << endl;
+            return false;
+        }
+        
+        visited.insert(current);
+        
+        // Get next page in chain
+        void* page = pager_get_page(pager, current);
+        if (page == nullptr) {
+            cout << "ERROR: Cannot load freelist page " << current << endl;
+            return false;
+        }
+        
+        uint32_t next_free;
+        memcpy(&next_free, page, sizeof(uint32_t));
+        current = next_free;
+        
+        // Safety: Limit chain length to prevent infinite loops
+        if (visited.size() > pager->num_pages) {
+            cout << "ERROR: Freelist chain too long (possible corruption)" << endl;
+            return false;
         }
     }
-    */
     
-    // No free pages available, allocate a new one
-    return pager->num_pages;
+    return true;
+}
+
+uint32_t get_unused_page_num(Pager* pager) {
+    // Persistent freelist: use free_head and linked list in file
+    if (pager->free_head == 0) {
+        // No free pages, allocate a new one
+        return pager->num_pages++;
+    }
+    // Reuse page from freelist
+    uint32_t page_num = pager->free_head;
+    void* page = pager_get_page(pager, page_num);
+    if (page == nullptr) {
+        // Critical error: fallback to new page
+        return pager->num_pages++;
+    }
+    // Read next free page from first 4 bytes
+    memcpy(&pager->free_head, page, sizeof(uint32_t));
+    // Clear page before reuse
+    memset(page, 0, PAGE_SIZE);
+    return page_num;
 }
 
 void free_page(Pager* pager, uint32_t page_num) {
-    // FREELIST OPTIMIZATION: Add page to free list
+    // Persistent freelist: add page to front of linked list
     if (pager == nullptr || page_num >= TABLE_MAX_PAGES) {
         return;
     }
-    
     void* page = pager_get_page(pager, page_num);
     if (page == nullptr) {
         return;
     }
-    
-    // Store the current free_head in the first 4 bytes of this page
+    // Write current free_head into first 4 bytes of freed page
     memcpy(page, &pager->free_head, sizeof(uint32_t));
-    
-    // Make this page the new head of the free list
     pager->free_head = page_num;
-    
-    // Flush the page to disk
+    // Flush this page immediately
     pager_flush(pager, page_num);
 }
 
@@ -263,32 +303,25 @@ Table* new_table(const string& filename) {
 void free_table(Table* table) {
     Pager* pager = table->pager;
 
-    // Flush all cached pages
+    // Flush all cached pages in LRU cache
     bool had_flush_error = false;
-    for (int i = 0; i < pager->num_pages; i++) { // Iterate up to known num_pages
-        if (pager->pages[i] != nullptr) {
-            PagerResult result = pager_flush(pager, i);
-            if (result != PAGER_SUCCESS) {
-                cout << "Warning: Failed to flush page " << i << ". Data may be lost." << endl;
-                had_flush_error = true;
-                // Don't exit - try to flush remaining pages
-            }
-            delete[] static_cast<char*>(pager->pages[i]);
-            pager->pages[i] = nullptr;
+    for (auto const& [page_num, page_data] : pager->page_cache) {
+        if (pager_flush(pager, page_num) != PAGER_SUCCESS) {
+            cout << "Warning: Failed to flush page " << page_num << ". Data may be lost." << endl;
+            had_flush_error = true;
         }
+        delete[] static_cast<char*>(page_data);
     }
+    pager->page_cache.clear();
+    pager->lru_list.clear();
+    pager->lru_map.clear();
 
-     // --- WRITE FINAL HEADER ---
+    // --- WRITE FINAL HEADER ---
     if (pager->file_stream.is_open()) {
-        // Write the final header (root_page_num + free_head) before closing
         pager->file_stream.seekp(0);
-        pager->file_stream.write(reinterpret_cast<char*>(&pager->root_page_num), sizeof(pager->root_page_num));
-        pager->file_stream.write(reinterpret_cast<char*>(&pager->free_head), sizeof(pager->free_head));
-        if (pager->file_stream.fail()) {
-             cout << "Error writing final header to database file." << endl;
-             // Don't exit here, try to close file anyway
-             had_flush_error = true;
-        }
+        pager->file_stream.write(reinterpret_cast<char*>(&pager->root_page_num), sizeof(uint32_t));
+        pager->file_stream.write(reinterpret_cast<char*>(&pager->free_head), sizeof(uint32_t));
+        pager->file_stream.flush();
         pager->file_stream.close();
     }
 
@@ -545,8 +578,8 @@ uint32_t* get_internal_node_right_child(void* node) {
 uint32_t* get_internal_node_child(void* node, uint32_t child_num) {
     uint32_t num_keys = *get_internal_node_num_keys(node);
     if (child_num > num_keys) {
-        cout << "Error: Tried to access child_num " << child_num << " > num_keys " << num_keys << endl;
-        exit(EXIT_FAILURE);
+        // Return nullptr instead of exit(EXIT_FAILURE)
+        return nullptr;
     }
     return reinterpret_cast<uint32_t*>(static_cast<char*>(node) + INTERNAL_NODE_HEADER_SIZE + child_num * INTERNAL_NODE_CELL_SIZE);
 }
@@ -665,7 +698,11 @@ Cursor* table_find(Table* table, uint32_t key) {
         if (min_index == num_keys) {
             page_num = *get_internal_node_right_child(node);
         } else {
-            page_num = *get_internal_node_child(node, min_index);
+            uint32_t* child_ptr = get_internal_node_child(node, min_index);
+            if (child_ptr == nullptr) {
+                return nullptr;
+            }
+            page_num = *child_ptr;
         }
 
         node = pager_get_page(table->pager, page_num);
@@ -792,17 +829,19 @@ void internal_node_insert(Table* table, uint32_t parent_page_num, uint32_t child
 
     // If the new key is greater than all existing keys, update the right child
     if (child_max_key > get_node_max_key(table->pager, right_child)) {
-        *get_internal_node_child(parent, original_num_keys) = right_child_page_num;
-        *get_internal_node_key(parent, original_num_keys) = get_node_max_key(table->pager, right_child);
-        *get_internal_node_right_child(parent) = child_page_num;
+    uint32_t* child_ptr = get_internal_node_child(parent, original_num_keys);
+    if (child_ptr) *child_ptr = right_child_page_num;
+    *get_internal_node_key(parent, original_num_keys) = get_node_max_key(table->pager, right_child);
+    *get_internal_node_right_child(parent) = child_page_num;
     } else {
         // Make room for the new cell by shifting cells to the right
         for (uint32_t i = original_num_keys; i > index; i--) {
-            void* destination = get_internal_node_child(parent, i);
-            void* source = get_internal_node_child(parent, i - 1);
-            memcpy(destination, source, INTERNAL_NODE_CELL_SIZE);
+            uint32_t* dest_ptr = get_internal_node_child(parent, i);
+            uint32_t* src_ptr = get_internal_node_child(parent, i - 1);
+            if (dest_ptr && src_ptr) memcpy(dest_ptr, src_ptr, INTERNAL_NODE_CELL_SIZE);
         }
-        *get_internal_node_child(parent, index) = child_page_num;
+        uint32_t* child_ptr = get_internal_node_child(parent, index);
+        if (child_ptr) *child_ptr = child_page_num;
         *get_internal_node_key(parent, index) = child_max_key;
     }
     *get_internal_node_num_keys(parent) += 1;
@@ -830,7 +869,8 @@ void internal_node_split_and_insert(Table* table, uint32_t parent_page_num, uint
     
     // Copy existing keys and children to temp arrays
     for (uint32_t i = 0; i < old_num_keys; i++) {
-        temp_children[i] = *get_internal_node_child(old_node, i);
+    uint32_t* child_ptr = get_internal_node_child(old_node, i);
+    temp_children[i] = child_ptr ? *child_ptr : 0;
         temp_keys[i] = *get_internal_node_key(old_node, i);
     }
     temp_children[old_num_keys] = *get_internal_node_right_child(old_node);
@@ -866,7 +906,8 @@ void internal_node_split_and_insert(Table* table, uint32_t parent_page_num, uint
     // Update old node with left half
     *get_internal_node_num_keys(old_node) = split_at;
     for (uint32_t i = 0; i < split_at; i++) {
-        *get_internal_node_child(old_node, i) = temp_children[i];
+    uint32_t* child_ptr = get_internal_node_child(old_node, i);
+    if (child_ptr) *child_ptr = temp_children[i];
         *get_internal_node_key(old_node, i) = temp_keys[i];
     }
     *get_internal_node_right_child(old_node) = temp_children[split_at];
@@ -877,14 +918,16 @@ void internal_node_split_and_insert(Table* table, uint32_t parent_page_num, uint
     uint32_t new_num_keys = (old_num_keys + 1) - split_at;
     *get_internal_node_num_keys(new_node) = new_num_keys;
     for (uint32_t i = 0; i < new_num_keys; i++) {
-        *get_internal_node_child(new_node, i) = temp_children[split_at + 1 + i];
+    uint32_t* child_ptr = get_internal_node_child(new_node, i);
+    if (child_ptr) *child_ptr = temp_children[split_at + 1 + i];
         *get_internal_node_key(new_node, i) = temp_keys[split_at + 1 + i];
     }
     *get_internal_node_right_child(new_node) = temp_children[old_num_keys + 1];
     
     // Update parent pointers for all children of both nodes
     for (uint32_t i = 0; i <= split_at; i++) {
-        void* child_node = pager_get_page(table->pager, *get_internal_node_child(old_node, i <= split_at - 1 ? i : split_at));
+    uint32_t* child_ptr = get_internal_node_child(old_node, i <= split_at - 1 ? i : split_at);
+    void* child_node = child_ptr ? pager_get_page(table->pager, *child_ptr) : nullptr;
         if (i == split_at) {
             child_node = pager_get_page(table->pager, *get_internal_node_right_child(old_node));
         }
@@ -892,7 +935,8 @@ void internal_node_split_and_insert(Table* table, uint32_t parent_page_num, uint
     }
     
     for (uint32_t i = 0; i <= new_num_keys; i++) {
-        void* child_node = pager_get_page(table->pager, i < new_num_keys ? *get_internal_node_child(new_node, i) : *get_internal_node_right_child(new_node));
+    uint32_t* child_ptr = i < new_num_keys ? get_internal_node_child(new_node, i) : get_internal_node_right_child(new_node);
+    void* child_node = child_ptr ? pager_get_page(table->pager, *child_ptr) : nullptr;
         *get_node_parent(child_node) = new_page_num;
     }
     
@@ -1973,9 +2017,9 @@ void validate_tree(Table* table) {
     bool valid = validate_tree_node(table->pager, table->pager->root_page_num, &min_key, &max_key, &depth, true);
     
     if (valid) {
-        cout << "✓ Tree is valid! Depth: " << depth << endl;
+        cout << "✅ Tree is valid! Depth: " << depth << endl;
     } else {
-        cout << "✗ Tree validation FAILED!" << endl;
+        cout << "❌ Tree validation FAILED!" << endl;
     }
 }
 

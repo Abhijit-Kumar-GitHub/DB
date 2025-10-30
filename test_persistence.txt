@@ -1,0 +1,7 @@
+select
+.btree
+.validate
+insert 2 user2 user2@email.com
+insert 3 user3 user3@email.com
+select
+.exit
