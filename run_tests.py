@@ -56,7 +56,7 @@ class TestRunner:
             errors = []
             
             if should_validate:
-                if "Tree is valid!" not in output:
+                if "Tree structure is valid!" not in output:
                     passed = False
                     errors.append("❌ Tree validation failed")
                 if "Tree validation FAILED" in output:
@@ -268,7 +268,7 @@ def main():
     with open(test_file, 'r') as f:
         result = subprocess.run([runner.db_exe, db_file], stdin=f, capture_output=True, text=True, timeout=5)
     
-    if "Total rows: 10" in result.stdout and "Tree is valid!" in result.stdout:
+    if "Total rows: 10" in result.stdout and "Tree structure is valid!" in result.stdout:
         runner.tests_passed += 1
         print(f"✓ {'persistence':40s} PASSED")
     else:

@@ -1,16 +1,31 @@
-// main.cpp - Enhanced Version with Persistence Fix
-
-/*
+/**
+ * main.cpp - B-Tree Database Implementation
+ * 
+ * A production-grade B-Tree database engine with persistent storage, LRU caching,
+ * and crash-safe operations. Supports CRUD operations, range queries, and full
+ * tree validation.
+ * 
+ * KEY FEATURES:
+ * - Persistent disk storage with 8-byte header (root + freelist pointer)
+ * - LRU page cache (100 pages) with O(1) eviction
+ * - Persistent freelist using linked list in freed pages
+ * - Graceful error handling with nullptr propagation
+ * - B-Tree balancing: split, merge, and sibling borrowing
+ * - Tree validation for structural integrity
+ * 
  * TABLE OF CONTENTS:
- * 1. InputBuffer Functions (line 19)
- * 2. Pager Functions (line 36)
- * 3. Table Functions (line 169)
- * 4. Meta-Command Function (line 245)
- * 4. B-Tree Node Accessors (line )
- * 5. B-Tree Operations (line )
- * 6. Executor Functions (line )
- * 7. Visualization (line )
- * 8. Main REPL (line )
+ * 1. InputBuffer Functions    - REPL input handling
+ * 2. Pager Functions          - Disk I/O, caching, freelist management
+ * 3. Table Functions          - Database open/close operations
+ * 4. Meta-Command Function    - .exit, .btree, .validate, etc.
+ * 5. Parser Function          - SQL-like command parsing
+ * 6. Serialization Functions  - Row encoding/decoding
+ * 7. B-Tree Node Accessors    - Leaf and internal node field access
+ * 8. B-Tree Operations        - Insert, delete, split, merge, borrow
+ * 9. Executor Functions       - CRUD operation implementations
+ * 10. Validation Functions    - Tree integrity checks
+ * 11. Visualization Functions - Tree structure printing
+ * 12. Main REPL               - Command loop
  */
 
 #include "db.hpp"
@@ -18,10 +33,20 @@
 using namespace std;
 
 // --- InputBuffer Functions ---
+
+/**
+ * Creates and initializes a new input buffer for reading user commands.
+ * Returns: Pointer to newly allocated InputBuffer
+ */
 InputBuffer* new_input_buffer() {
     return new InputBuffer();
 }
 
+/**
+ * Reads a line of input from stdin into the buffer.
+ * Parameters:
+ *   input_buffer - Buffer to store the input line
+ */
 void read_input(InputBuffer* input_buffer) {
     getline(cin, input_buffer->buffer);
     if (cin.fail() && !cin.eof()) {
@@ -30,11 +55,24 @@ void read_input(InputBuffer* input_buffer) {
     }
 }
 
+/**
+ * Frees memory allocated for an input buffer.
+ * Parameters:
+ *   input_buffer - Buffer to deallocate
+ */
 void close_input_buffer(InputBuffer* input_buffer) {
     delete input_buffer;
 }
 
 // --- Pager Functions ---
+
+/**
+ * Opens a database file and initializes the pager.
+ * Creates a new file if it doesn't exist, or reads header from existing file.
+ * Parameters:
+ *   filename - Path to the database file
+ * Returns: Pointer to initialized Pager with file opened and header loaded
+ */
 Pager* pager_open(const string& filename) {
     Pager* pager = new Pager();
 
@@ -92,12 +130,24 @@ Pager* pager_open(const string& filename) {
     return pager;
 }
 
-// Calculates the byte offset for a given page number in the file
+/**
+ * Calculates the byte offset for a given page number in the file.
+ * Parameters:
+ *   page_num - Page number to calculate offset for
+ * Returns: Byte offset from start of file (accounting for 8-byte header)
+ */
 uint64_t get_page_file_offset(uint32_t page_num) {
     return DB_FILE_HEADER_SIZE + (uint64_t)page_num * PAGE_SIZE;
 }
 
-
+/**
+ * Retrieves a page from disk or cache using LRU eviction policy.
+ * Implements an LRU cache with fixed size (PAGER_CACHE_SIZE).
+ * Parameters:
+ *   pager    - Pager containing the file and cache
+ *   page_num - Page number to retrieve (0-indexed)
+ * Returns: Pointer to page data in memory, or nullptr on error
+ */
 void* pager_get_page(Pager* pager, uint32_t page_num) {
     if (page_num >= TABLE_MAX_PAGES) {
         cout << "Error: Tried to access page number out of bounds: " << page_num << endl;
@@ -117,7 +167,13 @@ void* pager_get_page(Pager* pager, uint32_t page_num) {
     if (pager->page_cache.size() >= PAGER_CACHE_SIZE) {
         uint32_t lru_page_num = pager->lru_list.back();
         void* lru_page_data = pager->page_cache[lru_page_num];
-        pager_flush(pager, lru_page_num);
+        
+        // Flush only if dirty (optimization: avoid unnecessary writes)
+        if (pager->dirty_pages.count(lru_page_num)) {
+            pager_flush(pager, lru_page_num);
+            pager->dirty_pages.erase(lru_page_num);
+        }
+        
         pager->lru_list.pop_back();
         pager->lru_map.erase(lru_page_num);
         delete[] static_cast<char*>(lru_page_data);
@@ -152,6 +208,14 @@ void* pager_get_page(Pager* pager, uint32_t page_num) {
     return new_page;
 }
 
+/**
+ * Writes a page from cache to disk.
+ * Parameters:
+ *   pager    - Pager containing the file and cache
+ *   page_num - Page number to flush to disk
+ * Returns: PAGER_SUCCESS on success, PAGER_NULL_PAGE if page not in cache,
+ *          PAGER_DISK_ERROR on write failure
+ */
 PagerResult pager_flush(Pager* pager, uint32_t page_num) {
     // Use page_cache instead of pages array
     if (pager->page_cache.count(page_num) == 0) {
@@ -171,7 +235,23 @@ PagerResult pager_flush(Pager* pager, uint32_t page_num) {
     return PAGER_SUCCESS;
 }
 
-// Validate freelist: Check for cycles and invalid page numbers
+/**
+ * Marks a page as dirty (modified) requiring flush to disk.
+ * Parameters:
+ *   pager    - Pager tracking dirty pages
+ *   page_num - Page number that was modified
+ */
+void mark_page_dirty(Pager* pager, uint32_t page_num) {
+    pager->dirty_pages.insert(page_num);
+}
+
+/**
+ * Validates the freelist for cycles and invalid page numbers.
+ * Used to detect corruption in the persistent freelist.
+ * Parameters:
+ *   pager - Pager to validate
+ * Returns: true if freelist is valid, false if cycle or invalid page detected
+ */
 bool validate_free_chain(Pager* pager) {
     if (pager->free_head == 0) {
         return true; // Empty freelist is valid
@@ -217,7 +297,21 @@ bool validate_free_chain(Pager* pager) {
     return true;
 }
 
+/**
+ * Allocates a new page number, reusing from freelist if available.
+ * Implements persistent freelist using linked list stored in freed pages.
+ * Parameters:
+ *   pager - Pager to allocate page from
+ * Returns: Page number of newly allocated or reused page
+ */
 uint32_t get_unused_page_num(Pager* pager) {
+    // Validate freelist integrity before reuse (detect cycles/corruption)
+    if (pager->free_head != 0 && !validate_free_chain(pager)) {
+        cout << "Warning: Corrupt freelist detected. Allocating new page instead." << endl;
+        pager->free_head = 0; // Reset corrupt freelist
+        return pager->num_pages++;
+    }
+    
     // Persistent freelist: use free_head and linked list in file
     if (pager->free_head == 0) {
         // No free pages, allocate a new one
@@ -237,6 +331,13 @@ uint32_t get_unused_page_num(Pager* pager) {
     return page_num;
 }
 
+/**
+ * Adds a page to the freelist for later reuse.
+ * Stores next pointer in first 4 bytes of the freed page.
+ * Parameters:
+ *   pager    - Pager containing the freelist
+ *   page_num - Page number to free and add to freelist
+ */
 void free_page(Pager* pager, uint32_t page_num) {
     // Persistent freelist: add page to front of linked list
     if (pager == nullptr || page_num >= TABLE_MAX_PAGES) {
@@ -254,6 +355,14 @@ void free_page(Pager* pager, uint32_t page_num) {
 }
 
 // --- Table/Pager Functions  ---
+
+/**
+ * Creates a new table by opening a database file.
+ * Initializes root page if needed.
+ * Parameters:
+ *   filename - Path to database file
+ * Returns: Pointer to initialized Table
+ */
 Table* new_table(const string& filename) {
     Table* table = new Table();
     Pager* pager = pager_open(filename); // Pager now reads root_page_num
@@ -300,21 +409,32 @@ Table* new_table(const string& filename) {
     return table;
 }
 
+/**
+ * Closes the database, flushes all pages to disk, and frees memory.
+ * Writes final header with root_page_num and free_head.
+ * Parameters:
+ *   table - Table to close and deallocate
+ */
 void free_table(Table* table) {
     Pager* pager = table->pager;
 
-    // Flush all cached pages in LRU cache
+    // Flush only dirty pages (optimization: skip clean pages)
     bool had_flush_error = false;
-    for (auto const& [page_num, page_data] : pager->page_cache) {
+    for (uint32_t page_num : pager->dirty_pages) {
         if (pager_flush(pager, page_num) != PAGER_SUCCESS) {
-            cout << "Warning: Failed to flush page " << page_num << ". Data may be lost." << endl;
+            cout << "Warning: Failed to flush dirty page " << page_num << ". Data may be lost." << endl;
             had_flush_error = true;
         }
+    }
+    
+    // Free all cached pages
+    for (auto const& [page_num, page_data] : pager->page_cache) {
         delete[] static_cast<char*>(page_data);
     }
     pager->page_cache.clear();
     pager->lru_list.clear();
     pager->lru_map.clear();
+    pager->dirty_pages.clear();
 
     // --- WRITE FINAL HEADER ---
     if (pager->file_stream.is_open()) {
@@ -334,7 +454,15 @@ void free_table(Table* table) {
 }
 
 // --- Meta-Command Function ---
-// (No changes needed here, uses table->pager->root_page_num implicitly via print_tree)
+
+/**
+ * Executes meta-commands (commands starting with '.').
+ * Supports: .exit, .btree, .validate, .constants, .debug
+ * Parameters:
+ *   input_buffer - Buffer containing the command
+ *   table        - Table to operate on
+ * Returns: META_COMMAND_SUCCESS or META_COMMAND_UNRECOGNIZED_COMMAND
+ */
 MetaCommandResult do_meta_command(InputBuffer* input_buffer, Table* table) {
     if (input_buffer->buffer == ".exit") {
         close_input_buffer(input_buffer);
@@ -389,9 +517,17 @@ MetaCommandResult do_meta_command(InputBuffer* input_buffer, Table* table) {
     }
 }
 
-
 // --- Parser Function  ---
-// (No changes needed here)
+
+/**
+ * Parses user input into a Statement structure.
+ * Supports: insert, select, find, delete, update, range
+ * Parameters:
+ *   input_buffer - Buffer containing the command
+ *   statement    - Output parameter to store parsed statement
+ * Returns: PREPARE_SUCCESS, PREPARE_SYNTAX_ERROR, PREPARE_STRING_TOO_LONG,
+ *          or PREPARE_UNRECOGNIZED_STATEMENT
+ */
 PrepareResult prepare_statement(InputBuffer* input_buffer, Statement* statement) {
     // INSERT
     if (input_buffer->buffer.rfind("insert", 0) == 0) {
@@ -520,14 +656,26 @@ PrepareResult prepare_statement(InputBuffer* input_buffer, Statement* statement)
     return PREPARE_UNRECOGNIZED_STATEMENT;
 }
 
-
 // --- Storage/Serialization Functions  ---
-// (No changes needed here)
+
+/**
+ * Serializes a Row structure into a byte buffer.
+ * Parameters:
+ *   source      - Row to serialize
+ *   destination - Buffer to write serialized data (must be ROW_SIZE bytes)
+ */
 void serialize_row(Row* source, void* destination) {
     memcpy(static_cast<char*>(destination) + ID_OFFSET, &(source->id), ID_SIZE);
     strncpy(static_cast<char*>(destination) + USERNAME_OFFSET, source->username, USERNAME_SIZE);
     strncpy(static_cast<char*>(destination) + EMAIL_OFFSET, source->email, EMAIL_SIZE);
 }
+
+/**
+ * Deserializes a byte buffer into a Row structure.
+ * Parameters:
+ *   source      - Buffer containing serialized row data
+ *   destination - Row structure to populate
+ */
 void deserialize_row(void* source, Row* destination) {
     memcpy(&(destination->id), static_cast<char*>(source) + ID_OFFSET, ID_SIZE);
     strncpy(destination->username, static_cast<char*>(source) + USERNAME_OFFSET, USERNAME_SIZE);
@@ -536,26 +684,69 @@ void deserialize_row(void* source, Row* destination) {
     destination->email[EMAIL_SIZE] = '\0';
 }
 
-
 // --- B-TREE NODE ACCESSOR FUNCTIONS ---
-// (No changes needed here, uses offsets correctly)
 
-// Leaf Node
+// Leaf Node Accessors
+
+/**
+ * Returns pointer to the num_cells field of a leaf node.
+ * Parameters:
+ *   node - Pointer to leaf node page
+ * Returns: Pointer to uint32_t num_cells field
+ */
 uint32_t* get_leaf_node_num_cells(void* node) {
     return reinterpret_cast<uint32_t*>(static_cast<char*>(node) + LEAF_NODE_NUM_CELLS_OFFSET);
 }
+
+/**
+ * Returns pointer to a specific cell in a leaf node.
+ * Parameters:
+ *   node     - Pointer to leaf node page
+ *   cell_num - Cell index (0-based)
+ * Returns: Pointer to the cell (key + value pair)
+ */
 void* get_leaf_node_cell(void* node, uint32_t cell_num) {
     return static_cast<char*>(node) + LEAF_NODE_HEADER_SIZE + cell_num * LEAF_NODE_CELL_SIZE;
 }
+
+/**
+ * Returns pointer to the key of a specific cell in a leaf node.
+ * Parameters:
+ *   node     - Pointer to leaf node page
+ *   cell_num - Cell index (0-based)
+ * Returns: Pointer to uint32_t key
+ */
 uint32_t* get_leaf_node_key(void* node, uint32_t cell_num) {
     return reinterpret_cast<uint32_t*>(get_leaf_node_cell(node, cell_num));
 }
+
+/**
+ * Returns pointer to the value (Row) of a specific cell in a leaf node.
+ * Parameters:
+ *   node     - Pointer to leaf node page
+ *   cell_num - Cell index (0-based)
+ * Returns: Pointer to serialized Row data
+ */
 void* get_leaf_node_value(void* node, uint32_t cell_num) {
     return static_cast<char*>(get_leaf_node_cell(node, cell_num)) + LEAF_NODE_KEY_SIZE;
 }
+
+/**
+ * Returns pointer to the next_leaf field of a leaf node.
+ * Used for linked list of leaf nodes for range queries.
+ * Parameters:
+ *   node - Pointer to leaf node page
+ * Returns: Pointer to uint32_t next_leaf page number
+ */
 uint32_t* get_leaf_node_next_leaf(void* node) {
     return reinterpret_cast<uint32_t*>(static_cast<char*>(node) + LEAF_NODE_NEXT_LEAF_OFFSET);
 }
+
+/**
+ * Initializes a new leaf node with default values.
+ * Parameters:
+ *   node - Pointer to page to initialize as leaf node
+ */
 void initialize_leaf_node(void* node) {
     set_node_type(node, NODE_LEAF);
     set_node_root(node, false);
@@ -563,18 +754,48 @@ void initialize_leaf_node(void* node) {
     *get_leaf_node_next_leaf(node) = 0;
 }
 
-// Internal Node
+// Internal Node Accessors
+
+/**
+ * Initializes a new internal node with default values.
+ * Parameters:
+ *   node - Pointer to page to initialize as internal node
+ */
 void initialize_internal_node(void* node) {
     set_node_type(node, NODE_INTERNAL);
     set_node_root(node, false);
     *get_internal_node_num_keys(node) = 0;
 }
+
+/**
+ * Returns pointer to the num_keys field of an internal node.
+ * Parameters:
+ *   node - Pointer to internal node page
+ * Returns: Pointer to uint32_t num_keys field
+ */
 uint32_t* get_internal_node_num_keys(void* node) {
     return reinterpret_cast<uint32_t*>(static_cast<char*>(node) + INTERNAL_NODE_NUM_KEYS_OFFSET);
 }
+
+/**
+ * Returns pointer to the right_child field of an internal node.
+ * The rightmost child pointer is stored separately from the cells.
+ * Parameters:
+ *   node - Pointer to internal node page
+ * Returns: Pointer to uint32_t right_child page number
+ */
 uint32_t* get_internal_node_right_child(void* node) {
     return reinterpret_cast<uint32_t*>(static_cast<char*>(node) + INTERNAL_NODE_RIGHT_CHILD_OFFSET);
 }
+
+/**
+ * Returns pointer to a specific child pointer in an internal node.
+ * Returns nullptr if child_num is out of bounds (for error handling).
+ * Parameters:
+ *   node      - Pointer to internal node page
+ *   child_num - Child index (0-based)
+ * Returns: Pointer to uint32_t child page number, or nullptr if out of bounds
+ */
 uint32_t* get_internal_node_child(void* node, uint32_t child_num) {
     uint32_t num_keys = *get_internal_node_num_keys(node);
     if (child_num > num_keys) {
@@ -583,10 +804,28 @@ uint32_t* get_internal_node_child(void* node, uint32_t child_num) {
     }
     return reinterpret_cast<uint32_t*>(static_cast<char*>(node) + INTERNAL_NODE_HEADER_SIZE + child_num * INTERNAL_NODE_CELL_SIZE);
 }
+
+/**
+ * Returns pointer to a specific key in an internal node.
+ * Parameters:
+ *   node    - Pointer to internal node page
+ *   key_num - Key index (0-based)
+ * Returns: Pointer to uint32_t key value
+ */
 uint32_t* get_internal_node_key(void* node, uint32_t key_num) {
     void* child_ptr = get_internal_node_child(node, key_num);
     return reinterpret_cast<uint32_t*>(reinterpret_cast<char*>(child_ptr) + INTERNAL_NODE_CHILD_SIZE);
 }
+
+/**
+ * Returns the maximum key stored in a node (leaf or internal).
+ * For leaf nodes, returns the last key. For internal nodes, recursively
+ * finds the maximum key in the rightmost child.
+ * Parameters:
+ *   pager - Pager to access child pages
+ *   node  - Node to find max key in
+ * Returns: Maximum key value in the node
+ */
 uint32_t get_node_max_key(Pager* pager, void* node) {
     if (node == nullptr) {
         cout << "Error: get_node_max_key called with nullptr" << endl;
@@ -616,30 +855,73 @@ uint32_t get_node_max_key(Pager* pager, void* node) {
     }
 }
 
-// Common Node
+// Common Node Accessors (work for both leaf and internal nodes)
+
+/**
+ * Gets the type of a node (NODE_LEAF or NODE_INTERNAL).
+ * Parameters:
+ *   node - Pointer to node page
+ * Returns: NodeType enum value
+ */
 NodeType get_node_type(void* node) {
     uint8_t value = *reinterpret_cast<uint8_t*>(static_cast<char*>(node) + NODE_TYPE_OFFSET);
     return (NodeType)value;
 }
+
+/**
+ * Sets the type of a node.
+ * Parameters:
+ *   node - Pointer to node page
+ *   type - NodeType to set (NODE_LEAF or NODE_INTERNAL)
+ */
 void set_node_type(void* node, NodeType type) {
     uint8_t value = type;
     *reinterpret_cast<uint8_t*>(static_cast<char*>(node) + NODE_TYPE_OFFSET) = value;
 }
+
+/**
+ * Checks if a node is the root node.
+ * Parameters:
+ *   node - Pointer to node page
+ * Returns: true if node is root, false otherwise
+ */
 bool is_node_root(void* node) {
     uint8_t value = *reinterpret_cast<uint8_t*>(static_cast<char*>(node) + IS_ROOT_OFFSET);
     return (bool)value;
 }
+
+/**
+ * Sets whether a node is the root node.
+ * Parameters:
+ *   node    - Pointer to node page
+ *   is_root - true to mark as root, false otherwise
+ */
 void set_node_root(void* node, bool is_root) {
     uint8_t value = is_root;
     *reinterpret_cast<uint8_t*>(static_cast<char*>(node) + IS_ROOT_OFFSET) = value;
 }
+
+/**
+ * Returns pointer to the parent page number field of a node.
+ * Parameters:
+ *   node - Pointer to node page
+ * Returns: Pointer to uint32_t parent page number
+ */
 uint32_t* get_node_parent(void* node) {
     return reinterpret_cast<uint32_t*>(static_cast<char*>(node) + PARENT_POINTER_OFFSET);
 }
 
 // --- B-TREE CURSOR/INSERT FUNCTIONS ---
-// (No changes needed here, logic uses pager->root_page_num via table_find/start)
 
+/**
+ * Performs binary search to find a key in a leaf node.
+ * Returns cursor positioned at the key if found, or at insertion point if not found.
+ * Parameters:
+ *   table    - Table to search in
+ *   page_num - Page number of the leaf node
+ *   key      - Key to search for
+ * Returns: Cursor positioned at key or insertion point
+ */
 Cursor* leaf_node_find(Table* table, uint32_t page_num, uint32_t key) {
     void* node = pager_get_page(table->pager, page_num);
     if (node == nullptr) {
@@ -673,6 +955,14 @@ Cursor* leaf_node_find(Table* table, uint32_t page_num, uint32_t key) {
     return cursor;
 }
 
+/**
+ * Finds the leaf node and position for a given key in the B-Tree.
+ * Traverses from root through internal nodes to reach the appropriate leaf.
+ * Parameters:
+ *   table - Table to search in
+ *   key   - Key to search for
+ * Returns: Cursor positioned at key or insertion point in leaf node
+ */
 Cursor* table_find(Table* table, uint32_t key) {
     uint32_t page_num = table->pager->root_page_num; // Use pager's root
     void* node = pager_get_page(table->pager, page_num);
@@ -714,6 +1004,13 @@ Cursor* table_find(Table* table, uint32_t key) {
     return leaf_node_find(table, page_num, key);
 }
 
+/**
+ * Returns a cursor pointing to the start of the table (smallest key).
+ * Used for full table scans (SELECT).
+ * Parameters:
+ *   table - Table to get start cursor for
+ * Returns: Cursor at first record, or end_of_table if empty
+ */
 Cursor* table_start(Table* table) {
     Cursor* cursor = table_find(table, 0); // Find starting from the correct root
     if (cursor == nullptr) {
@@ -733,6 +1030,14 @@ Cursor* table_start(Table* table) {
     return cursor;
 }
 
+/**
+ * Inserts a key-value pair into a leaf node at cursor position.
+ * Assumes there is space in the node (caller must check and split if needed).
+ * Parameters:
+ *   cursor - Cursor pointing to insertion position
+ *   key    - Key to insert
+ *   value  - Row data to insert
+ */
 void leaf_node_insert(Cursor* cursor, uint32_t key, Row* value) {
     void* node = pager_get_page(cursor->table->pager, cursor->page_num);
     if (node == nullptr) {
@@ -750,8 +1055,18 @@ void leaf_node_insert(Cursor* cursor, uint32_t key, Row* value) {
     *(get_leaf_node_num_cells(node)) += 1;
     *(get_leaf_node_key(node, cursor->cell_num)) = key;
     serialize_row(value, get_leaf_node_value(node, cursor->cell_num));
+    
+    // Mark page as dirty (modified)
+    cursor->table->pager->dirty_pages.insert(cursor->page_num);
 }
 
+/**
+ * Creates a new root node when the old root splits.
+ * The old root becomes the left child, and a new sibling becomes the right child.
+ * Parameters:
+ *   table                 - Table to update
+ *   right_child_page_num  - Page number of the new right child (sibling)
+ */
 void create_new_root(Table* table, uint32_t right_child_page_num) {
     void* root = pager_get_page(table->pager, table->pager->root_page_num); // Get current root
     if (root == nullptr) {
@@ -784,10 +1099,24 @@ void create_new_root(Table* table, uint32_t right_child_page_num) {
 
     set_node_root(root, false);
     set_node_root(right_child, false);
+    
+    // Mark all modified pages as dirty
+    mark_page_dirty(table->pager, new_root_page_num);
+    mark_page_dirty(table->pager, left_child_page_num);
+    mark_page_dirty(table->pager, right_child_page_num);
 }
 
+// Forward declaration for internal node operations
 void internal_node_split_and_insert(Table* table, uint32_t parent_page_num, uint32_t child_page_num);
 
+/**
+ * Inserts a child/key pair into an internal node.
+ * Splits the internal node if it's full.
+ * Parameters:
+ *   table           - Table containing the B-Tree
+ *   parent_page_num - Page number of the internal node
+ *   child_page_num  - Page number of the child to insert
+ */
 void internal_node_insert(Table* table, uint32_t parent_page_num, uint32_t child_page_num) {
     // Add a new child/key pair to parent that corresponds to child
     void* parent = pager_get_page(table->pager, parent_page_num);
@@ -847,6 +1176,14 @@ void internal_node_insert(Table* table, uint32_t parent_page_num, uint32_t child
     *get_internal_node_num_keys(parent) += 1;
 }
 
+/**
+ * Splits an internal node when it's full and inserts a new child.
+ * Distributes keys evenly between old and new nodes, updates parent pointers.
+ * Parameters:
+ *   table           - Table containing the B-Tree
+ *   parent_page_num - Page number of the full internal node
+ *   child_page_num  - Page number of the child to insert
+ */
 void internal_node_split_and_insert(Table* table, uint32_t parent_page_num, uint32_t child_page_num) {
     void* old_node = pager_get_page(table->pager, parent_page_num);
     if (old_node == nullptr) {
@@ -970,6 +1307,14 @@ void internal_node_split_and_insert(Table* table, uint32_t parent_page_num, uint
     }
 }
 
+/**
+ * Splits a full leaf node and inserts a new key-value pair.
+ * Creates a new leaf node, distributes cells evenly, updates parent.
+ * Parameters:
+ *   cursor - Cursor pointing to insertion position in full leaf
+ *   key    - Key to insert
+ *   value  - Row data to insert
+ */
 void leaf_node_split_and_insert(Cursor* cursor, uint32_t key, Row* value) {
     void* old_node = pager_get_page(cursor->table->pager, cursor->page_num);
     if (old_node == nullptr) {
@@ -1033,6 +1378,12 @@ void leaf_node_split_and_insert(Cursor* cursor, uint32_t key, Row* value) {
     }
 }
 
+/**
+ * Deletes a cell from a leaf node at cursor position.
+ * Shifts remaining cells left to fill the gap.
+ * Parameters:
+ *   cursor - Cursor pointing to cell to delete
+ */
 void leaf_node_delete(Cursor* cursor) {
     void* node = pager_get_page(cursor->table->pager, cursor->page_num);
     if (node == nullptr) {
@@ -1054,7 +1405,14 @@ void leaf_node_delete(Cursor* cursor) {
     }
 }
 
-// Helper: Find the index of a child in its parent
+/**
+ * Finds the index of a child pointer in its parent node.
+ * Used for rebalancing operations.
+ * Parameters:
+ *   parent         - Pointer to parent internal node
+ *   child_page_num - Page number of child to find
+ * Returns: Index of child in parent (0-based), or -1 if not found
+ */
 int32_t find_child_index_in_parent(void* parent, uint32_t child_page_num) {
     uint32_t num_keys = *get_internal_node_num_keys(parent);
     
@@ -1075,7 +1433,14 @@ int32_t find_child_index_in_parent(void* parent, uint32_t child_page_num) {
     return -1; // Not found
 }
 
-// Handle leaf node underflow by borrowing or merging
+/**
+ * Handles underflow in a leaf node (< 50% full) after deletion.
+ * Attempts to borrow from siblings, otherwise merges with a sibling.
+ * May recursively trigger underflow handling in parent.
+ * Parameters:
+ *   table    - Table containing the B-Tree
+ *   page_num - Page number of underflowing leaf node
+ */
 void handle_leaf_underflow(Table* table, uint32_t page_num) {
     // SAFETY: Comprehensive null guards
     if (table == nullptr || table->pager == nullptr) {
@@ -1347,7 +1712,14 @@ void handle_leaf_underflow(Table* table, uint32_t page_num) {
     }
 }
 
-// Handle internal node underflow by borrowing or merging
+/**
+ * Handles underflow in an internal node (< 50% full) after deletion.
+ * Attempts to borrow from siblings, otherwise merges with a sibling.
+ * May recursively trigger underflow handling in parent.
+ * Parameters:
+ *   table    - Table containing the B-Tree
+ *   page_num - Page number of underflowing internal node
+ */
 void handle_internal_underflow(Table* table, uint32_t page_num) {
     // SAFETY: Comprehensive null guards
     if (table == nullptr || table->pager == nullptr) {
@@ -1617,6 +1989,12 @@ void handle_internal_underflow(Table* table, uint32_t page_num) {
 }
 
 // --- Helper function to print a row  ---
+
+/**
+ * Prints a row in formatted output.
+ * Parameters:
+ *   row - Row to print
+ */
 void print_row(Row* row) {
     cout << "(" << row->id << ", "
          << row->username << ", "
@@ -1630,7 +2008,13 @@ struct KeyLocation {
     bool key_found;
 };
 
-// Helper function to find a key and check if it exists
+/**
+ * Finds a key in the table and returns cursor and node information.
+ * Parameters:
+ *   table - Table to search in
+ *   key   - Key to find
+ * Returns: KeyLocation struct with cursor, node, and found flag
+ */
 KeyLocation find_key_location(Table* table, uint32_t key) {
     Cursor* cursor = table_find(table, key);
     if (cursor == nullptr) {
@@ -1653,7 +2037,15 @@ KeyLocation find_key_location(Table* table, uint32_t key) {
 }
 
 // --- Executor Functions ---
-// (No changes needed, uses table_find which uses pager->root_page_num)
+
+/**
+ * Executes an INSERT statement.
+ * Checks for duplicate keys and splits nodes if necessary.
+ * Parameters:
+ *   statement - Statement containing row to insert
+ *   table     - Table to insert into
+ * Returns: EXECUTE_SUCCESS, EXECUTE_DUPLICATE_KEY, or error code
+ */
 ExecuteResult execute_insert(Statement* statement, Table* table) {
     // SAFETY: Comprehensive null guards
     if (statement == nullptr || table == nullptr) {
@@ -1688,6 +2080,14 @@ ExecuteResult execute_insert(Statement* statement, Table* table) {
     return EXECUTE_SUCCESS;
 }
 
+/**
+ * Executes a SELECT statement (full table scan).
+ * Prints all rows in sorted order by traversing leaf nodes.
+ * Parameters:
+ *   statement - Statement (unused for SELECT)
+ *   table     - Table to select from
+ * Returns: EXECUTE_SUCCESS or error code
+ */
 ExecuteResult execute_select(Statement* statement, Table* table) {
     // SAFETY: Comprehensive null guards
     if (table == nullptr) {
@@ -1733,6 +2133,13 @@ ExecuteResult execute_select(Statement* statement, Table* table) {
     return EXECUTE_SUCCESS;
 }
 
+/**
+ * Executes a FIND statement (lookup by key).
+ * Parameters:
+ *   statement - Statement containing key to find
+ *   table     - Table to search in
+ * Returns: EXECUTE_SUCCESS, EXECUTE_RECORD_NOT_FOUND, or error code
+ */
 ExecuteResult execute_find(Statement* statement, Table* table) {
     // SAFETY: Comprehensive null guards
     if (statement == nullptr || table == nullptr) {
@@ -1760,6 +2167,14 @@ ExecuteResult execute_find(Statement* statement, Table* table) {
     return EXECUTE_RECORD_NOT_FOUND;
 }
 
+/**
+ * Executes a DELETE statement.
+ * Removes the record and handles underflow if necessary.
+ * Parameters:
+ *   statement - Statement containing key to delete
+ *   table     - Table to delete from
+ * Returns: EXECUTE_SUCCESS, EXECUTE_RECORD_NOT_FOUND, or error code
+ */
 ExecuteResult execute_delete(Statement* statement, Table* table) {
     // SAFETY: Comprehensive null guards
     if (statement == nullptr || table == nullptr) {
@@ -1785,6 +2200,14 @@ ExecuteResult execute_delete(Statement* statement, Table* table) {
     return EXECUTE_RECORD_NOT_FOUND;
 }
 
+/**
+ * Executes an UPDATE statement.
+ * Finds the record by key and updates username and email fields.
+ * Parameters:
+ *   statement - Statement containing key and new row data
+ *   table     - Table to update
+ * Returns: EXECUTE_SUCCESS, EXECUTE_RECORD_NOT_FOUND, or error code
+ */
 ExecuteResult execute_update(Statement* statement, Table* table) {
     // SAFETY: Comprehensive null guards
     if (statement == nullptr || table == nullptr) {
@@ -1811,6 +2234,13 @@ ExecuteResult execute_update(Statement* statement, Table* table) {
     return EXECUTE_RECORD_NOT_FOUND;
 }
 
+/**
+ * Executes a RANGE query (returns rows with keys in [start, end]).
+ * Parameters:
+ *   statement - Statement containing range_start and range_end
+ *   table     - Table to query
+ * Returns: EXECUTE_SUCCESS or error code
+ */
 ExecuteResult execute_range(Statement* statement, Table* table) {
     // SAFETY: Comprehensive null guards
     if (statement == nullptr || table == nullptr) {
@@ -1875,6 +2305,13 @@ ExecuteResult execute_range(Statement* statement, Table* table) {
     return EXECUTE_SUCCESS;
 }
 
+/**
+ * Dispatcher function that executes a statement based on its type.
+ * Parameters:
+ *   statement - Statement to execute
+ *   table     - Table to operate on
+ * Returns: ExecuteResult from the specific executor function
+ */
 ExecuteResult execute_statement(Statement* statement, Table* table) {
     switch (statement->type) {
         case (STATEMENT_INSERT):
@@ -1893,7 +2330,18 @@ ExecuteResult execute_statement(Statement* statement, Table* table) {
     return EXECUTE_SUCCESS;
 }
 
-// SAFETY: Tree validation function with asserts
+/**
+ * Recursively validates a B-Tree node and its subtree.
+ * Checks key ordering, fill factor, uniform depth, and parent consistency.
+ * Parameters:
+ *   pager        - Pager to access pages
+ *   page_num     - Page number of node to validate
+ *   min_key      - Output: minimum key in subtree
+ *   max_key      - Output: maximum key in subtree
+ *   depth        - Output: depth of subtree
+ *   is_root_call - true if this is the root node
+ * Returns: true if valid, false if validation fails
+ */
 bool validate_tree_node(Pager* pager, uint32_t page_num, uint32_t* min_key, uint32_t* max_key, int* depth, bool is_root_call) {
     if (pager == nullptr) {
         cout << "ERROR: Null pager in validate_tree_node" << endl;
@@ -2004,6 +2452,12 @@ bool validate_tree_node(Pager* pager, uint32_t page_num, uint32_t* min_key, uint
     }
 }
 
+/**
+ * Validates the entire B-Tree for structural correctness.
+ * Checks all invariants and prints validation results.
+ * Parameters:
+ *   table - Table containing the B-Tree to validate
+ */
 void validate_tree(Table* table) {
     if (table == nullptr || table->pager == nullptr) {
         cout << "ERROR: Null table or pager in validate_tree" << endl;
@@ -2011,19 +2465,36 @@ void validate_tree(Table* table) {
     }
     
     cout << "=== Validating B-Tree ===" << endl;
+    
+    // Validate freelist integrity first
+    if (!validate_free_chain(table->pager)) {
+        cout << "❌ Freelist validation FAILED! (cycle or corruption detected)" << endl;
+        return;
+    }
+    cout << "✅ Freelist is valid" << endl;
+    
+    // Validate tree structure
     uint32_t min_key, max_key;
     int depth;
     
     bool valid = validate_tree_node(table->pager, table->pager->root_page_num, &min_key, &max_key, &depth, true);
     
     if (valid) {
-        cout << "✅ Tree is valid! Depth: " << depth << endl;
+        cout << "✅ Tree structure is valid! Depth: " << depth << endl;
     } else {
-        cout << "❌ Tree validation FAILED!" << endl;
+        cout << "❌ Tree structure validation FAILED!" << endl;
     }
 }
 
-// NEW: Tree visualization functions
+// --- Tree visualization functions ---
+
+/**
+ * Recursively prints a node and its children in tree format.
+ * Parameters:
+ *   pager        - Pager to access pages
+ *   page_num     - Page number of node to print
+ *   indent_level - Indentation level for formatting
+ */
 void print_node(Pager* pager, uint32_t page_num, uint32_t indent_level) {
     void* node = pager_get_page(pager, page_num);
     if (node == nullptr) {
@@ -2068,16 +2539,33 @@ void print_node(Pager* pager, uint32_t page_num, uint32_t indent_level) {
     }
 }
 
+/**
+ * Prints the entire B-Tree structure starting from root.
+ * Parameters:
+ *   table - Table containing the B-Tree to print
+ */
 void print_tree(Table* table) {
     print_node(table->pager, table->pager->root_page_num, 0); // Use pager's root
 }
 
 // --- REPL (Main)  ---
+
+/**
+ * Prints the command prompt.
+ */
 void print_prompt() { 
     cout << "db > ";
     cout.flush(); // Ensure prompt is displayed immediately
 }
 
+/**
+ * Main REPL (Read-Eval-Print Loop) for the database.
+ * Opens database file, reads commands, executes them, and handles results.
+ * Parameters:
+ *   argc - Number of command-line arguments
+ *   argv - Array of command-line arguments (argv[1] = database filename)
+ * Returns: 0 on success, EXIT_FAILURE on error
+ */
 int main(int argc, char* argv[]) {
     if (argc < 2) {
         cout << "Must supply a database filename." << endl;
