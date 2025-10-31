@@ -1,9 +1,0 @@
-insert 1 user1 user1@email.com
-insert 1 user2 user2@email.com
-find 99
-delete 99
-update 99 test test@email.com
-select
-.btree
-.validate
-.exit

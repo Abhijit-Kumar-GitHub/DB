@@ -546,7 +546,7 @@ See [TECHNICAL_REPORT.md](TECHNICAL_REPORT.md) for:- Height for 1M records: ~6 l
 
 - Recursion (tree traversal, underflow handling)
 
-- Merge/split operations (balancing)│ Key₂ | Value₂              │
+- Merge/split operations (balancing)│ Key₂ | Value₂   e           │
 
 - Serialization (binary I/O)
 

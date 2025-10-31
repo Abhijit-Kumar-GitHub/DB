@@ -1,4 +1,0 @@
-select
-.btree
-.validate
-.exit

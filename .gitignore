@@ -1,0 +1,53 @@
+# Build artifacts
+cmake-build-*/
+build/
+*.exe
+*.out
+*.o
+*.obj
+
+# Test databases
+*.db
+
+# Test command files
+test_*.txt
+manual_test_commands.txt
+
+# Development notes (keep only TECHNICAL_REPORT.md)
+BUG_FIX_COMPLETE.md
+DOCUMENTATION_SUMMARY.md
+EDGE_CASE_ANALYSIS.md
+EDGE_CASE_SUMMARY.md
+FREELIST_IMPLEMENTATION.md
+
+# Testing utilities
+check_constants.cpp
+check_constants.exe
+
+# IDE specific
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS specific
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# Backup files
+*.bak
+*.old
+*_backup.*
