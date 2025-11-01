@@ -1174,6 +1174,9 @@ void internal_node_insert(Table* table, uint32_t parent_page_num, uint32_t child
         *get_internal_node_key(parent, index) = child_max_key;
     }
     *get_internal_node_num_keys(parent) += 1;
+    
+    // BUG FIX #4: Mark parent page as dirty after modifying it
+    mark_page_dirty(table->pager, parent_page_num);
 }
 
 /**
@@ -1284,6 +1287,10 @@ void internal_node_split_and_insert(Table* table, uint32_t parent_page_num, uint
     delete[] temp_keys;
     delete[] temp_children;
     
+    // BUG FIX #4: Mark both old and new nodes as dirty after split
+    mark_page_dirty(table->pager, parent_page_num);
+    mark_page_dirty(table->pager, new_page_num);
+    
     // If the old node is root, create a new root
     if (is_node_root(old_node)) {
         create_new_root(table, new_page_num);
@@ -1301,6 +1308,9 @@ void internal_node_split_and_insert(Table* table, uint32_t parent_page_num, uint
                 break;
             }
         }
+        
+        // BUG FIX #4: Mark parent as dirty after updating key
+        mark_page_dirty(table->pager, parent_page_num_for_insert);
         
         // Insert the new child into the parent (this may recursively split)
         internal_node_insert(table, parent_page_num_for_insert, new_page_num);
@@ -1398,6 +1408,7 @@ void leaf_node_delete(Cursor* cursor) {
     }
 
     *get_leaf_node_num_cells(node) -= 1;
+    mark_page_dirty(cursor->table->pager, cursor->page_num); // BUG FIX: Mark page dirty after delete
     
     // Check for underflow (only if not root)
     if (!is_node_root(node) && *get_leaf_node_num_cells(node) < LEAF_NODE_MIN_CELLS) {
@@ -1509,9 +1520,20 @@ void handle_leaf_underflow(Table* table, uint32_t page_num) {
             *get_leaf_node_num_cells(node) = current_cells + 1;
             *get_leaf_node_num_cells(right_sibling) = right_sibling_cells - 1;
             
-            // CRITICAL FIX: Update parent key to the NEW first key of right sibling (borrowed key)
-            // not the new max of current node
-            *get_internal_node_key(parent, child_index) = *get_leaf_node_key(right_sibling, 0);
+            // CRITICAL FIX: Update BOTH parent keys after borrowing
+            // key[child_index] should be max of current node (we just added a cell)
+            // key[child_index+1] should be max of right sibling (if it exists as a key, not right_child)
+            *get_internal_node_key(parent, child_index) = get_node_max_key(table->pager, node);
+            
+            // If right sibling is NOT the rightmost child, update its key too
+            if ((uint32_t)child_index + 1 < num_parent_keys) {
+                *get_internal_node_key(parent, child_index + 1) = get_node_max_key(table->pager, right_sibling);
+            }
+            
+            // BUG FIX #4: Mark all modified pages as dirty (node, sibling, parent)
+            mark_page_dirty(table->pager, page_num);
+            mark_page_dirty(table->pager, right_sibling_page_num);
+            mark_page_dirty(table->pager, parent_page_num);
             
             return; // Successfully borrowed
             }
@@ -1550,6 +1572,11 @@ void handle_leaf_underflow(Table* table, uint32_t page_num) {
             uint32_t new_left_max = get_node_max_key(table->pager, left_sibling);
             *get_internal_node_key(parent, child_index - 1) = new_left_max;
             
+            // BUG FIX #4: Mark all modified pages as dirty (node, sibling, parent)
+            mark_page_dirty(table->pager, page_num);
+            mark_page_dirty(table->pager, left_sibling_page_num);
+            mark_page_dirty(table->pager, parent_page_num);
+            
             return; // Successfully borrowed
             }
         }
@@ -1559,48 +1586,91 @@ void handle_leaf_underflow(Table* table, uint32_t page_num) {
     // Prefer merging with left sibling if it exists
     if (child_index > 0) {
         // Merge with left sibling
+        // CRITICAL FIX: Merge left sibling INTO current node (not vice versa)
+        // This preserves the current node's page number, so next pointers from
+        // other nodes remain valid
         uint32_t left_sibling_page_num = *get_internal_node_child(parent, child_index - 1);
         void* left_sibling = pager_get_page(table->pager, left_sibling_page_num);
         uint32_t left_cells = *get_leaf_node_num_cells(left_sibling);
         uint32_t current_cells = *get_leaf_node_num_cells(node);
         
-        // Copy all cells from current node to left sibling
-        for (uint32_t i = 0; i < current_cells; i++) {
-            void* dest = get_leaf_node_cell(left_sibling, left_cells + i);
+        // Make room at the beginning of current node for left sibling's cells
+        for (int32_t i = current_cells - 1; i >= 0; i--) {
+            void* dest = get_leaf_node_cell(node, left_cells + i);
             void* src = get_leaf_node_cell(node, i);
+            memmove(dest, src, LEAF_NODE_CELL_SIZE);
+        }
+        
+        // Copy all cells from left sibling to beginning of current node
+        for (uint32_t i = 0; i < left_cells; i++) {
+            void* dest = get_leaf_node_cell(node, i);
+            void* src = get_leaf_node_cell(left_sibling, i);
             memcpy(dest, src, LEAF_NODE_CELL_SIZE);
         }
         
-        *get_leaf_node_num_cells(left_sibling) = left_cells + current_cells;
+        *get_leaf_node_num_cells(node) = left_cells + current_cells;
         
-        // Update next leaf pointer
-        *get_leaf_node_next_leaf(left_sibling) = *get_leaf_node_next_leaf(node);
-        
-        // CRITICAL FIX: Update left sibling's max key in parent BEFORE shifting
-        // Must do this before removing entries while indices are still correct
-        uint32_t new_left_max = get_node_max_key(table->pager, left_sibling);
-        if (child_index > 0) {
-            *get_internal_node_key(parent, child_index - 1) = new_left_max;
+        // BUG FIX #3: Replace O(n²) bubble sort with O(n log n) sort
+        // Prior borrowing operations may have left keys unsorted, so sorting is necessary
+        uint32_t total_cells = left_cells + current_cells;
+        if (total_cells > 1) {
+            // Create vector of (key, cell_index) pairs
+            std::vector<std::pair<uint32_t, uint32_t>> key_indices;
+            key_indices.reserve(total_cells);
+            for (uint32_t i = 0; i < total_cells; i++) {
+                key_indices.push_back({*get_leaf_node_key(node, i), i});
+            }
+            
+            // Sort by key (O(n log n))
+            std::sort(key_indices.begin(), key_indices.end());
+            
+            // Create temporary buffer and rearrange cells according to sorted order
+            char* temp_buffer = new char[total_cells * LEAF_NODE_CELL_SIZE];
+            for (uint32_t i = 0; i < total_cells; i++) {
+                uint32_t old_index = key_indices[i].second;
+                memcpy(temp_buffer + i * LEAF_NODE_CELL_SIZE, get_leaf_node_cell(node, old_index), LEAF_NODE_CELL_SIZE);
+            }
+            
+            // Copy sorted cells back to node
+            for (uint32_t i = 0; i < total_cells; i++) {
+                memcpy(get_leaf_node_cell(node, i), temp_buffer + i * LEAF_NODE_CELL_SIZE, LEAF_NODE_CELL_SIZE);
+            }
+            
+            delete[] temp_buffer;
         }
         
-        // Remove current node's entry from parent
+        // Current node keeps its next pointer (already correct)
+        // No need to update since we're keeping this node
+        
+        // CRITICAL FIX: Update current node's max key in parent
+        uint32_t new_max = get_node_max_key(table->pager, node);
+        *get_internal_node_key(parent, child_index) = new_max;
+        
+        // Update left sibling's key if it exists
+        if (child_index > 1) {
+            *get_internal_node_key(parent, child_index - 1) = get_node_max_key(table->pager, left_sibling);
+        }
+        
+        // Remove left sibling's entry from parent
         // Shift keys and children left
         // CRITICAL FIX: Use memmove for safe overlapping memory operations
-        if (child_index < num_parent_keys - 1) {
+        if (child_index > 1) {
             // Shift children
-            memmove(get_internal_node_child(parent, child_index),
-                   get_internal_node_child(parent, child_index + 1),
-                   (num_parent_keys - child_index - 1) * sizeof(uint32_t));
+            memmove(get_internal_node_child(parent, child_index - 1),
+                   get_internal_node_child(parent, child_index),
+                   (num_parent_keys - child_index) * sizeof(uint32_t));
             // Shift keys
-            memmove(get_internal_node_key(parent, child_index),
-                   get_internal_node_key(parent, child_index + 1),
-                   (num_parent_keys - child_index - 1) * sizeof(uint32_t));
-        }
-        
-        // If we removed the last key, update child pointer
-        if ((uint32_t)child_index == num_parent_keys - 1) {
-            // The child at the removed position becomes the right child's old value
-            *get_internal_node_child(parent, num_parent_keys - 1) = *get_internal_node_right_child(parent);
+            memmove(get_internal_node_key(parent, child_index - 1),
+                   get_internal_node_key(parent, child_index),
+                   (num_parent_keys - child_index) * sizeof(uint32_t));
+        } else {
+            // Left sibling is child[0], so shift everything from child[1] onward
+            memmove(get_internal_node_child(parent, 0),
+                   get_internal_node_child(parent, 1),
+                   (num_parent_keys - 1) * sizeof(uint32_t));
+            memmove(get_internal_node_key(parent, 0),
+                   get_internal_node_key(parent, 1),
+                   (num_parent_keys - 1) * sizeof(uint32_t));
         }
         
         // Update parent key count
@@ -1617,22 +1687,26 @@ void handle_leaf_underflow(Table* table, uint32_t page_num) {
             }
         }
         
+        // BUG FIX #4: Mark modified pages as dirty before any potential recursion
+        mark_page_dirty(table->pager, page_num);  // Current node was modified
+        mark_page_dirty(table->pager, parent_page_num);  // Parent was modified
+        
         // Special case: if parent is root and now has only 1 child
         if (is_node_root(parent) && *get_internal_node_num_keys(parent) == 0) {
-            // The merged node becomes the new root
-            table->pager->root_page_num = left_sibling_page_num;
-            set_node_root(left_sibling, true);
-            *get_node_parent(left_sibling) = 0; // Root has no parent
-            // Safe to free now since parent is being replaced
-            free_page(table->pager, page_num);
+            // The merged node (current node) becomes the new root
+            table->pager->root_page_num = page_num;
+            set_node_root(node, true);
+            *get_node_parent(node) = 0; // Root has no parent
+            // Free the left sibling (which was merged into current)
+            free_page(table->pager, left_sibling_page_num);
         } else if (!is_node_root(parent) && *get_internal_node_num_keys(parent) < INTERNAL_NODE_MIN_KEYS) {
             // CRITICAL: Free BEFORE recursive call to avoid use-after-free
-            free_page(table->pager, page_num);
+            free_page(table->pager, left_sibling_page_num);
             // Parent now has underflow - recursively handle it
             handle_internal_underflow(table, parent_page_num);
         } else {
-            // No underflow, safe to free
-            free_page(table->pager, page_num);
+            // No underflow, safe to free the left sibling
+            free_page(table->pager, left_sibling_page_num);
         }
         
     } else {
@@ -1650,6 +1724,35 @@ void handle_leaf_underflow(Table* table, uint32_t page_num) {
         }
         
         *get_leaf_node_num_cells(node) = current_cells + right_cells;
+        
+        // BUG FIX #3: Replace O(n²) bubble sort with O(n log n) sort
+        // Prior borrowing operations may have left keys unsorted, so sorting is necessary
+        uint32_t total_cells = current_cells + right_cells;
+        if (total_cells > 1) {
+            // Create vector of (key, cell_index) pairs
+            std::vector<std::pair<uint32_t, uint32_t>> key_indices;
+            key_indices.reserve(total_cells);
+            for (uint32_t i = 0; i < total_cells; i++) {
+                key_indices.push_back({*get_leaf_node_key(node, i), i});
+            }
+            
+            // Sort by key (O(n log n))
+            std::sort(key_indices.begin(), key_indices.end());
+            
+            // Create temporary buffer and rearrange cells according to sorted order
+            char* temp_buffer = new char[total_cells * LEAF_NODE_CELL_SIZE];
+            for (uint32_t i = 0; i < total_cells; i++) {
+                uint32_t old_index = key_indices[i].second;
+                memcpy(temp_buffer + i * LEAF_NODE_CELL_SIZE, get_leaf_node_cell(node, old_index), LEAF_NODE_CELL_SIZE);
+            }
+            
+            // Copy sorted cells back to node
+            for (uint32_t i = 0; i < total_cells; i++) {
+                memcpy(get_leaf_node_cell(node, i), temp_buffer + i * LEAF_NODE_CELL_SIZE, LEAF_NODE_CELL_SIZE);
+            }
+            
+            delete[] temp_buffer;
+        }
         
         // Update next leaf pointer
         *get_leaf_node_next_leaf(node) = *get_leaf_node_next_leaf(right_sibling);
@@ -1691,6 +1794,10 @@ void handle_leaf_underflow(Table* table, uint32_t page_num) {
                 *get_internal_node_key(parent, i) = child_max;
             }
         }
+        
+        // BUG FIX #4: Mark modified pages as dirty before any potential recursion
+        mark_page_dirty(table->pager, page_num);  // Current node was modified
+        mark_page_dirty(table->pager, parent_page_num);  // Parent was modified
         
         // Special case: if parent is root and now has only 1 child
         if (is_node_root(parent) && *get_internal_node_num_keys(parent) == 0) {
@@ -1804,6 +1911,14 @@ void handle_internal_underflow(Table* table, uint32_t page_num) {
                 uint32_t new_max = get_node_max_key(table->pager, node);
                 *get_internal_node_key(parent, child_index) = new_max;
                 
+                // BUG FIX #4: Mark all modified pages as dirty (node, sibling, parent, borrowed child)
+                mark_page_dirty(table->pager, page_num);
+                mark_page_dirty(table->pager, right_sibling_page_num);
+                mark_page_dirty(table->pager, parent_page_num);
+                if (borrowed_child_node != nullptr) {
+                    mark_page_dirty(table->pager, borrowed_child);
+                }
+                
                 return; // Successfully borrowed
             }
         }
@@ -1850,6 +1965,14 @@ void handle_internal_underflow(Table* table, uint32_t page_num) {
                 // Update parent key for left sibling
                 uint32_t new_left_max = get_node_max_key(table->pager, left_sibling);
                 *get_internal_node_key(parent, child_index - 1) = new_left_max;
+                
+                // BUG FIX #4: Mark all modified pages as dirty (node, sibling, parent, borrowed child)
+                mark_page_dirty(table->pager, page_num);
+                mark_page_dirty(table->pager, left_sibling_page_num);
+                mark_page_dirty(table->pager, parent_page_num);
+                if (borrowed_child_node != nullptr) {
+                    mark_page_dirty(table->pager, borrowed_child);
+                }
                 
                 return; // Successfully borrowed
             }
@@ -1906,6 +2029,16 @@ void handle_internal_underflow(Table* table, uint32_t page_num) {
         }
         
         *get_internal_node_num_keys(parent) = num_parent_keys - 1;
+        
+        // BUG FIX #4: Mark modified pages as dirty before any potential recursion
+        mark_page_dirty(table->pager, left_sibling_page_num);  // Left sibling was modified
+        mark_page_dirty(table->pager, parent_page_num);  // Parent was modified
+        // Mark all children whose parent pointers were updated
+        for (uint32_t i = 0; i < num_keys; i++) {
+            uint32_t child_page = *get_internal_node_child(node, i);
+            mark_page_dirty(table->pager, child_page);
+        }
+        mark_page_dirty(table->pager, *get_internal_node_right_child(node));
         
         // Special case: if parent is root and now empty
         if (is_node_root(parent) && *get_internal_node_num_keys(parent) == 0) {
@@ -1968,6 +2101,16 @@ void handle_internal_underflow(Table* table, uint32_t page_num) {
         }
         
         *get_internal_node_num_keys(parent) = num_parent_keys - 1;
+        
+        // BUG FIX #4: Mark modified pages as dirty before any potential recursion
+        mark_page_dirty(table->pager, page_num);  // Current node was modified
+        mark_page_dirty(table->pager, parent_page_num);  // Parent was modified
+        // Mark all children whose parent pointers were updated
+        for (uint32_t i = 0; i < right_keys; i++) {
+            uint32_t child_page = *get_internal_node_child(right_sibling, i);
+            mark_page_dirty(table->pager, child_page);
+        }
+        mark_page_dirty(table->pager, *get_internal_node_right_child(right_sibling));
         
         // Special case: if parent is root and now empty
         if (is_node_root(parent) && *get_internal_node_num_keys(parent) == 0) {
@@ -2226,6 +2369,7 @@ ExecuteResult execute_update(Statement* statement, Table* table) {
     if (loc.key_found) {
         Row* row_to_update = &(statement->row_to_insert);
         serialize_row(row_to_update, get_leaf_node_value(loc.node, loc.cursor->cell_num));
+        mark_page_dirty(loc.cursor->table->pager, loc.cursor->page_num); // BUG FIX: Mark page dirty after update
         delete loc.cursor;
         return EXECUTE_SUCCESS;
     }

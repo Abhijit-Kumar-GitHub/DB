@@ -28,6 +28,7 @@
 #include <map>
 #include <list>
 #include <set>
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <sstream>

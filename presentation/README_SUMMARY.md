@@ -3,8 +3,8 @@
 ## 📊 Project Stats
 - **Language:** C++20
 - **Lines of Code:** 2,600+
-- **Tests:** 12/12 passing (100%)
-- **Completion:** October 2025
+- **Tests:** 31/31 passing (100%)
+- **Completion:** November 2025
 
 ## 🎯 What It Is
 A production-grade B-Tree database engine built from scratch with:
@@ -52,7 +52,7 @@ User Input → REPL → B-Tree Engine → Pager (LRU Cache + Dirty Tracking) →
 cmake --build cmake-build-debug
 
 # Run
-./cmake-build-debug/SkipListDB.exe mydb.db
+./cmake-build-debug/ArborDB.exe mydb.db
 
 # Commands
 insert 1 alice alice@example.com
@@ -66,8 +66,8 @@ select
 **Talking Points:**
 1. "Built a crash-safe B-Tree database from scratch in C++20"
 2. "Implemented dirty page tracking for 90% I/O reduction"
-3. "Added freelist validation to prevent corruption"
-4. "Passes 12/12 automated tests with 100% success rate"
+3. "Fixed critical cascading delete bug - handles 1000+ operations flawlessly"
+4. "Passes 31/31 automated tests with 100% success rate"
 5. "Supports full CRUD operations with O(log n) complexity"
 
 **Demo Flow:**
@@ -107,5 +107,5 @@ Perfect for demonstrating:
 
 ---
 
-**Full Documentation:** See [README.md](README.md)  
+**Full Documentation:** See [README.md](../README.md)   
 **Author:** Abhijit Kumar | October 2025

@@ -51,3 +51,8 @@ Makefile
 *.bak
 *.old
 *_backup.*
+
+
+# Logs
+*.log
+
