@@ -57,7 +57,7 @@ SECTION 6: PERSISTENCE TEST (Copy line by line)
 ================================================================================
 
 .exit
-.\cmake-build-debug\ArborDB.exe demo.db
+.\cmake-build-debug\ArborDB.exe mydb.db
 select
 .validate
 .exit
@@ -72,7 +72,7 @@ python run_tests.py
 CLEANUP AFTER DEMO (Run this after presentation)
 ================================================================================
 
-Remove-Item demo.db
+Remove-Item mydb.db
 
 ================================================================================
 ALTERNATE DEMO: QUICK VERSION (If Time is Short - 2 minutes)
@@ -200,7 +200,7 @@ The database survives restarts. I've even tested it with kill -9."
 SECTION 7:
 "Finally, let me run the automated test suite...
 [Wait for tests]
-12 out of 12 tests passing. 100% success rate."
+35 out of 35 tests passing. 100% success rate."
 
 [RETURN TO SLIDES]
 "As you just saw, everything works. Let me show you what makes this

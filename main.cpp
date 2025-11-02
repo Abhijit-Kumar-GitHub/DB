@@ -2612,10 +2612,10 @@ void validate_tree(Table* table) {
     
     // Validate freelist integrity first
     if (!validate_free_chain(table->pager)) {
-        cout << "❌ Freelist validation FAILED! (cycle or corruption detected)" << endl;
+        cout << "Freelist validation FAILED! (cycle or corruption detected)" << endl;
         return;
     }
-    cout << "✅ Freelist is valid" << endl;
+    cout << "Freelist is valid" << endl;
     
     // Validate tree structure
     uint32_t min_key, max_key;
@@ -2624,22 +2624,52 @@ void validate_tree(Table* table) {
     bool valid = validate_tree_node(table->pager, table->pager->root_page_num, &min_key, &max_key, &depth, true);
     
     if (valid) {
-        cout << "✅ Tree structure is valid! Depth: " << depth << endl;
+        cout << "Tree structure is valid! Depth: " << depth << endl;
     } else {
-        cout << "❌ Tree structure validation FAILED!" << endl;
+        cout << "Tree structure validation FAILED!" << endl;
     }
 }
 
 // --- Tree visualization functions ---
 
 /**
- * Recursively prints a node and its children in tree format.
+ * Recursively prints a node and its children in tree format (internal implementation).
  * Parameters:
  *   pager        - Pager to access pages
  *   page_num     - Page number of node to print
  *   indent_level - Indentation level for formatting
+ *   visited      - Set to track visited pages and detect cycles
  */
-void print_node(Pager* pager, uint32_t page_num, uint32_t indent_level) {
+void print_node_internal(Pager* pager, uint32_t page_num, uint32_t indent_level, std::set<uint32_t>& visited) {
+    // BUG FIX: Prevent infinite loops - check for cycles
+    if (visited.count(page_num)) {
+        for (uint32_t i = 0; i < indent_level; i++) {
+            cout << "  ";
+        }
+        cout << "- ERROR: Cycle detected! Page " << page_num << " already visited" << endl;
+        return;
+    }
+    
+    // BUG FIX: Prevent infinite loops - limit recursion depth
+    if (indent_level > 50) {
+        for (uint32_t i = 0; i < indent_level; i++) {
+            cout << "  ";
+        }
+        cout << "- ERROR: Max recursion depth exceeded (possible corruption)" << endl;
+        return;
+    }
+    
+    // BUG FIX: Validate page number before access
+    if (page_num >= TABLE_MAX_PAGES) {
+        for (uint32_t i = 0; i < indent_level; i++) {
+            cout << "  ";
+        }
+        cout << "- ERROR: Invalid page number " << page_num << endl;
+        return;
+    }
+    
+    visited.insert(page_num);
+    
     void* node = pager_get_page(pager, page_num);
     if (node == nullptr) {
         for (uint32_t i = 0; i < indent_level; i++) {
@@ -2670,7 +2700,7 @@ void print_node(Pager* pager, uint32_t page_num, uint32_t indent_level) {
 
         for (uint32_t i = 0; i < num_keys; i++) {
             uint32_t child = *get_internal_node_child(node, i);
-            print_node(pager, child, indent_level + 1);
+            print_node_internal(pager, child, indent_level + 1, visited);
 
             for (uint32_t j = 0; j < indent_level + 1; j++) {
                 cout << "  ";
@@ -2679,8 +2709,20 @@ void print_node(Pager* pager, uint32_t page_num, uint32_t indent_level) {
         }
 
         uint32_t right_child = *get_internal_node_right_child(node);
-        print_node(pager, right_child, indent_level + 1);
+        print_node_internal(pager, right_child, indent_level + 1, visited);
     }
+}
+
+/**
+ * Recursively prints a node and its children in tree format.
+ * Parameters:
+ *   pager        - Pager to access pages
+ *   page_num     - Page number of node to print
+ *   indent_level - Indentation level for formatting
+ */
+void print_node(Pager* pager, uint32_t page_num, uint32_t indent_level) {
+    std::set<uint32_t> visited;
+    print_node_internal(pager, page_num, indent_level, visited);
 }
 
 /**
