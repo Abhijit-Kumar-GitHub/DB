@@ -56,3 +56,6 @@ Makefile
 # Logs
 *.log
 
+
+learning/
+presentation/

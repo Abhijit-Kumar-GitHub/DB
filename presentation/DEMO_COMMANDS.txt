@@ -1,17 +1,8 @@
-# Demo Commands - Copy-Paste During Presentation
-# Keep this file open and ready to copy from
-
-================================================================================
-SECTION 1: BUILD AND START (Copy line by line)
-================================================================================
 
 Clear-Host
 cmake --build cmake-build-debug
 .\cmake-build-debug\ArborDB.exe demo.db
 
-================================================================================
-SECTION 2: BASIC OPERATIONS (Copy all at once)
-================================================================================
 
 insert 1 alice alice@example.com
 insert 2 bob bob@example.com
@@ -19,9 +10,6 @@ insert 3 charlie charlie@example.com
 select
 .btree
 
-================================================================================
-SECTION 3: TRIGGER NODE SPLIT (Copy all at once to save time)
-================================================================================
 
 insert 4 david david@example.com
 insert 5 emma emma@example.com
@@ -36,25 +24,20 @@ insert 13 mary mary@example.com
 insert 14 nancy nancy@example.com
 insert 15 oscar oscar@example.com
 
-================================================================================
-SECTION 4: SHOW SPLIT RESULT (Copy line by line)
-================================================================================
+
 
 .btree
 .validate
 
-================================================================================
-SECTION 5: DELETE AND SHOW FREELIST (Copy all at once)
-================================================================================
+
 
 delete 5
 delete 6
 delete 7
 .validate
 
-================================================================================
-SECTION 6: PERSISTENCE TEST (Copy line by line)
-================================================================================
+
+ (Get-Content presentation\insert_1000_records.txt), ".btree", ".exit" | .\cmake-build-debug\ArborDB.exe test_1000.db > presentation\btree_1000.txt
 
 .exit
 .\cmake-build-debug\ArborDB.exe mydb.db
@@ -62,21 +45,13 @@ select
 .validate
 .exit
 
-================================================================================
-SECTION 7: RUN TESTS (Copy as one command)
-================================================================================
+
 
 python run_tests.py
 
-================================================================================
-CLEANUP AFTER DEMO (Run this after presentation)
-================================================================================
 
-Remove-Item mydb.db
 
-================================================================================
-ALTERNATE DEMO: QUICK VERSION (If Time is Short - 2 minutes)
-================================================================================
+
 
 # Build and start
 cmake --build cmake-build-debug
@@ -109,9 +84,6 @@ python run_tests.py
 # Cleanup
 Remove-Item quick.db
 
-================================================================================
-TROUBLESHOOTING COMMANDS
-================================================================================
 
 # If demo.db exists from previous run:
 Remove-Item demo.db -ErrorAction SilentlyContinue
@@ -130,96 +102,3 @@ Test-Path .\cmake-build-debug\ArborDB.exe
 # Run single test to verify:
 echo "insert 1 test test@test.com`nselect`n.exit" | .\cmake-build-debug\ArborDB.exe test.db
 
-================================================================================
-PRESENTATION FLOW WITH COMMANDS
-================================================================================
-
-0. BEFORE STARTING SLIDES:
-   - Have this file open in notepad
-   - Have terminal open in project directory
-   - Run: Remove-Item *.db -ErrorAction SilentlyContinue
-   - Run: Clear-Host
-
-1. SLIDES 1-10:
-   - Present normally
-   - At Slide 10, say "Now let me show you this in action"
-
-2. SWITCH TO TERMINAL:
-   - Make sure terminal is visible
-   - Zoom in if text is small (Ctrl + Mouse Wheel)
-
-3. DEMO SEQUENCE:
-   a) Copy from SECTION 1, paste, explain build
-   b) Copy from SECTION 2, paste line by line, explain each
-   c) Copy from SECTION 3, paste all, explain "inserting 12 more records"
-   d) Copy from SECTION 4, paste, explain split result
-   e) Copy from SECTION 5, paste, explain freelist
-   f) Copy from SECTION 6, paste line by line, explain persistence
-   g) Copy from SECTION 7, paste, wait for results, show 12/12
-
-4. SWITCH BACK TO SLIDES:
-   - Go to Slide 11
-   - Continue presentation
-
-5. AFTER PRESENTATION:
-   - Run cleanup command
-   - Answer questions
-
-================================================================================
-WHAT TO SAY DURING EACH SECTION
-================================================================================
-
-SECTION 1:
-"First, let me build the project... Clean build, no errors. 
-Now starting the database with a new file called demo.db..."
-
-SECTION 2:
-"I'll insert three records... There's alice, bob, and charlie.
-Now let me select all records... All three are there, sorted by ID.
-The .btree command shows internal structure - right now it's one leaf node."
-
-SECTION 3:
-"Now I'll insert 12 more records to trigger a node split.
-A leaf node can hold 13 records, so the 14th will cause a split..."
-[Wait for inserts to complete]
-
-SECTION 4:
-"Look at the tree structure now... We have an internal node at the root
-with two leaf children. This is automatic rebalancing.
-The validation confirms both tree and freelist are healthy."
-
-SECTION 5:
-"Let me delete a few records... These go to the freelist for reuse.
-Validation still passes - the freelist has no cycles."
-
-SECTION 6:
-"Now the important part - persistence. I'm closing the database...
-Reopening the same file... And all 12 records are still there.
-The database survives restarts. I've even tested it with kill -9."
-
-SECTION 7:
-"Finally, let me run the automated test suite...
-[Wait for tests]
-35 out of 35 tests passing. 100% success rate."
-
-[RETURN TO SLIDES]
-"As you just saw, everything works. Let me show you what makes this
-production-grade..."
-
-================================================================================
-TIMING GUIDE
-================================================================================
-
-Section 1 (Build):        20 seconds
-Section 2 (Basic ops):    30 seconds
-Section 3 (Split setup):  20 seconds (paste all at once)
-Section 4 (Show split):   20 seconds
-Section 5 (Delete):       15 seconds
-Section 6 (Persistence):  45 seconds
-Section 7 (Tests):        30 seconds
-
-TOTAL DEMO TIME: ~3 minutes
-
-Add 1 minute buffer for explanations = 4 minutes total
-
-================================================================================
