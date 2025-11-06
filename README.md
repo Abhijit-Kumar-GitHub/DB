@@ -193,12 +193,12 @@ MIN_FILL_FACTOR = 50%
 ### 1. Binary Search Descent
 Navigates internal nodes using binary search: **O(log n)**
 
-### 2. Dirty Page Tracking (NEW - Nov 2025)
+### 2. Dirty Page Tracking 
 - **Purpose:** Minimize unnecessary disk writes
 - **Implementation:** `std::set<uint32_t> dirty_pages` in Pager
 - **Impact:** ~90% I/O reduction for read-heavy workloads
 
-### 3. Freelist Validation (NEW - Nov 2025)
+### 3. Freelist Validation 
 - **Purpose:** Prevent corruption from cyclic freelist
 - **Implementation:** Cycle detection using slow/fast pointer technique
 - **Impact:** Prevents silent data corruption
@@ -214,7 +214,7 @@ Recycles deleted pages: **30-50% space savings**
 
 ---
 
-## 🚧 Recent Improvements (November 2025)
+## 🚧 Recent Improvements 
 
 ### Bug #4: Rebalancing Operations Persistence (CRITICAL)
 - **Problem:** Split, merge, and borrow operations didn't mark pages dirty, causing tree structure loss on restart
@@ -226,6 +226,7 @@ Recycles deleted pages: **30-50% space savings**
 - **Problem:** Used bubble sort (O(n²)) to sort merged keys
 - **Solution:** Replaced with std::sort (O(n log n))
 - **Impact:** Faster merge operations for large nodes
+- **Drawback:** Need to make the node merging such that it is already sorted, which will allow the Merge operatino at just O(n) time.
 
 ### Bug #2: Delete Persistence
 - **Problem:** Deletes that didn't trigger underflow weren't marked dirty
@@ -329,6 +330,9 @@ The `.validate` command performs comprehensive checks:
 - [ ] Write-Ahead Log (WAL) for durability
 - [ ] Network protocol (client-server with SQL support)
 - [ ] Full SQL parser and execution engine
+- [ ] Allowing custome table to be built as needed
+- [ ] Allowing multiple tables with relations to each others
+- [ ] Allowing multiple people to work on same table / database at same time.
 
 ---
 
@@ -353,6 +357,8 @@ GitHub: [@Abhijit-Kumar-GitHub](https://github.com/Abhijit-Kumar-GitHub)
 - Inspired by [SQLite](https://www.sqlite.org/) architecture
 - B-Tree implementation based on Knuth's *The Art of Computer Programming*
 - Testing methodology influenced by database research papers
+- Special thanks to [Spanning Tree](https://www.youtube.com/@SpanningTree) youtube channel for amazing visualization and simplifying the complex concept of B-Trees into something so elegant and seemingly trivial. This [video](https://youtu.be/K1a2Bk8NrYQ?si=_M1b_Y9ngHmEGIy3
+) was the inspiration and the reason for this project.
 
 ---
 
@@ -360,4 +366,4 @@ GitHub: [@Abhijit-Kumar-GitHub](https://github.com/Abhijit-Kumar-GitHub)
 
 ---
 
-*Last Updated: November 1, 2025*
+*Last Updated: November 6, 2025*
